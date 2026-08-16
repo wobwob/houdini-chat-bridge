@@ -14,7 +14,7 @@ from houdini_chat_bridge.snapshot import snapshot_network
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_snapshot_sorts_nodes_and_excludes_volatile_inspection_data(self):
+    def test_snapshot_sorts_nodes_and_excludes_volatile_inspection_data_but_keeps_comments(self):
         first, second = object(), object()
         records = {
             id(first): {
@@ -53,10 +53,35 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual([node["path"] for node in result["nodes"]], ["/obj/build/a_first", "/obj/build/z_last"])
         last = result["nodes"][1]
         self.assertNotIn("position", last)
-        self.assertNotIn("comment", last)
+        self.assertEqual(last["comment"], "Not part of a stable snapshot")
         self.assertNotIn("output_connections", last)
         self.assertEqual(last["parameters"][0], {"name": "animated", "expression": "$F", "expression_language": "Hscript"})
         json.dumps(result, sort_keys=True)
+
+    def test_recursive_snapshot_collects_descendants_once(self):
+        class Node:
+            def __init__(self, path, children=()):
+                self.path_value = path
+                self.children_value = list(children)
+
+            def path(self):
+                return self.path_value
+
+            def children(self):
+                return list(self.children_value)
+
+        leaf = Node("/obj/build/ASSEMBLY/POLE")
+        branch = Node("/obj/build/ASSEMBLY", [leaf])
+        root = Node("/obj/build", [branch])
+        records = {
+            id(branch): {"valid": True, "path": branch.path(), "name": "ASSEMBLY", "type_name": "subnet", "type_category": "Sop", "parameters": [], "input_connections": []},
+            id(leaf): {"valid": True, "path": leaf.path(), "name": "POLE", "type_name": "tube", "type_category": "Sop", "parameters": [], "input_connections": []},
+        }
+
+        with patch("houdini_chat_bridge.snapshot.inspect_node", side_effect=lambda node: records[id(node)]):
+            result = snapshot_network(root, recursive=True)
+
+        self.assertEqual([item["path"] for item in result["nodes"]], [branch.path(), leaf.path()])
 
 
 if __name__ == "__main__":

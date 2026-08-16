@@ -53,6 +53,9 @@ class FakeNode:
         self.display = False
         self.render = False
         self.position = None
+        self.comment = ""
+        self.boxes = []
+        self.hda_definition = FakeHDADefinition()
 
     def isValid(self):
         return True
@@ -80,6 +83,14 @@ class FakeNode:
         self.children.append(node)
         return node
 
+    def createNetworkBox(self, name):
+        box = FakeNetworkBox(self, name or "network_box")
+        self.boxes.append(box)
+        return box
+
+    def networkBoxes(self):
+        return list(self.boxes)
+
     def setPosition(self, position):
         self.position = position
 
@@ -102,6 +113,96 @@ class FakeNode:
 
     def setRenderFlag(self, enabled):
         self.render = enabled
+
+    def setComment(self, comment):
+        self.comment = comment
+
+    def createDigitalAsset(self, **kwargs):
+        self.hda_kwargs = kwargs
+        return self
+
+    def type(self):
+        return FakeNodeType(self.hda_definition, self.node_type_name)
+
+
+class FakeNetworkBox:
+    def __init__(self, parent, name):
+        self.parent_value = parent
+        self.name_value = name
+        self.contents = []
+        self.fit_count = 0
+        self.comment = ""
+        self.color = None
+
+    def parent(self):
+        return self.parent_value
+
+    def name(self):
+        return self.name_value
+
+    def items(self):
+        return list(self.contents)
+
+    def addItem(self, item):
+        self.contents.append(item)
+
+    def fitAroundContents(self):
+        self.fit_count += 1
+
+    def setComment(self, comment):
+        self.comment = comment
+
+    def setColor(self, color):
+        self.color = color
+
+
+class FakeOptions:
+    def __init__(self):
+        self.save_spare_parms = True
+
+    def setSaveSpareParms(self, value):
+        self.save_spare_parms = value
+
+
+class FakeHDADefinition:
+    def __init__(self):
+        self.options_value = FakeOptions()
+        self.parameter_group = None
+
+    def options(self):
+        return self.options_value
+
+    def setOptions(self, options):
+        self.options_value = options
+
+    def setParmTemplateGroup(self, group):
+        self.parameter_group = group
+
+
+class FakeNodeType:
+    def __init__(self, definition, name):
+        self.definition_value = definition
+        self.name_value = name
+
+    def definition(self):
+        return self.definition_value
+
+    def name(self):
+        return self.name_value
+
+
+class FakeParmTemplateGroup:
+    def __init__(self):
+        self.templates = []
+
+    def append(self, template):
+        self.templates.append(template)
+
+
+class FakeParmTemplate:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
 
 
 class FakeUndoGroup:
@@ -131,15 +232,32 @@ class FakeHou:
     def __init__(self, nodes, recorder):
         self.nodes = nodes
         self.undos = FakeUndos(recorder)
-        self.exprLanguage = type("ExprLanguage", (), {"Hscript": "Hscript"})
+        self.exprLanguage = type("ExprLanguage", (), {"Hscript": "Hscript", "Python": "Python"})
+        self.ParmTemplateGroup = FakeParmTemplateGroup
+        self.FolderParmTemplate = FakeParmTemplate
+        self.FloatParmTemplate = FakeParmTemplate
+        self.IntParmTemplate = FakeParmTemplate
+        self.ToggleParmTemplate = FakeParmTemplate
+        self.StringParmTemplate = FakeParmTemplate
+        self.MenuParmTemplate = FakeParmTemplate
 
     def node(self, path):
         return self.nodes.get(path)
 
+    def expandString(self, path):
+        return path
 
-def snapshot_for(parent):
+    def Color(self, value):
+        return tuple(value)
+
+
+def snapshot_for(parent, recursive=False):
     nodes = []
-    for node in parent.children:
+    pending = list(parent.children)
+    while pending:
+        node = pending.pop(0)
+        if recursive:
+            pending.extend(node.children)
         parameters = [
             {"name": name, "value": parameter.value}
             for name, parameter in sorted(node.parameters.items())
@@ -160,6 +278,7 @@ def snapshot_for(parent):
                 "type_category": "Sop",
                 "display_flag": node.display,
                 "render_flag": node.render,
+                "comment": node.comment,
                 "input_connections": inputs,
                 "parameters": parameters,
             }
@@ -314,6 +433,147 @@ class ExecutorTests(unittest.TestCase):
         self.assertIn("Parameter 'missing'", result["errors"][0]["message"])
         self.assertIn("Unsupported action", result["errors"][1]["message"])
         self.assertEqual(self.events, [])
+
+    def test_set_comment_is_diffed(self):
+        result = self.execute([
+            {"action": "set_node_comment", "node": "/obj/custom/POLE", "comment": "Primary support"},
+        ])
+
+        self.assertTrue(result["success"])
+        self.assertEqual(self.pole.comment, "Primary support")
+        self.assertEqual(result["diff"]["comment_changes"], [{
+            "node": "/obj/custom/POLE", "before": "", "after": "Primary support", "node_name": "POLE",
+        }])
+
+    def test_nested_nodes_and_network_box_references(self):
+        result = self.execute([
+            {"action": "create_node", "id": "subnet", "node_type_name": "subnet", "name": "ASSEMBLY"},
+            {"action": "create_node", "id": "a", "node_type_name": "tube", "name": "POLE", "parent": {"ref": "subnet"}},
+            {"action": "create_node", "id": "b", "node_type_name": "null", "name": "OUT", "parent": {"ref": "subnet"}},
+            {"action": "set_node_comment", "node": {"ref": "a"}, "comment": "Drives the output"},
+            {"action": "create_network_box", "id": "group", "name": "build", "parent": {"ref": "subnet"}},
+            {"action": "add_nodes_to_network_box", "box": {"ref": "group"}, "nodes": [{"ref": "a"}, {"ref": "b"}]},
+        ])
+
+        subnet = self.parent.children[-1]
+        pole, output = subnet.children
+        box = subnet.boxes[0]
+        self.assertTrue(result["success"])
+        self.assertEqual(pole.comment, "Drives the output")
+        self.assertEqual(box.contents, [pole, output])
+        self.assertEqual(box.fit_count, 1)
+        self.assertEqual(box.color, (0.0, 0.0, 0.0))
+        self.assertIn("/obj/custom/ASSEMBLY/POLE", [item["path"] for item in result["diff"]["created_nodes"]])
+
+    def test_network_box_membership_is_idempotent_and_wrong_parent_fails_in_group(self):
+        result = self.execute([
+            {"action": "create_node", "id": "subnet", "node_type_name": "subnet", "name": "ASSEMBLY"},
+            {"action": "create_node", "id": "child", "node_type_name": "tube", "name": "CHILD", "parent": {"ref": "subnet"}},
+            {"action": "create_network_box", "id": "root_box", "name": "root_box"},
+            {"action": "add_nodes_to_network_box", "box": {"ref": "root_box"}, "nodes": [{"ref": "child"}]},
+        ])
+
+        self.assertFalse(result["success"])
+        self.assertEqual(len(result["operations_completed"]), 3)
+        self.assertIn("not network box parent", result["errors"][0]["message"])
+        self.assertEqual(self.events.count(("group", "Houdini Chat Bridge batch")), 1)
+
+    def test_duplicate_ids_are_shared_across_nodes_and_network_boxes(self):
+        result = self.execute([
+            {"action": "create_node", "id": "thing", "node_type_name": "tube", "name": "A"},
+            {"action": "create_network_box", "id": "thing", "name": "B"},
+        ])
+
+        self.assertFalse(result["success"])
+        self.assertIn("Duplicate batch object id", result["errors"][0]["message"])
+
+    def test_unknown_network_box_and_forward_node_parent_are_rejected(self):
+        unknown_box = self.execute([
+            {"action": "add_nodes_to_network_box", "box": {"ref": "missing"}, "nodes": ["/obj/custom/POLE"]},
+        ])
+        forward_parent = self.execute([
+            {"action": "create_node", "id": "child", "node_type_name": "tube", "parent": {"ref": "subnet"}},
+            {"action": "create_node", "id": "subnet", "node_type_name": "subnet"},
+        ])
+
+        self.assertIn("Unknown symbolic reference", unknown_box["errors"][0]["message"])
+        self.assertIn("Forward symbolic reference", forward_parent["errors"][0]["message"])
+
+    def test_multiple_network_boxes_and_unknown_member_reference(self):
+        result = self.execute([
+            {"action": "create_node", "id": "a", "node_type_name": "tube", "name": "A"},
+            {"action": "create_node", "id": "b", "node_type_name": "null", "name": "B"},
+            {"action": "create_network_box", "id": "first", "name": "first"},
+            {"action": "create_network_box", "id": "second", "name": "second"},
+            {"action": "add_nodes_to_network_box", "box": {"ref": "first"}, "nodes": [{"ref": "a"}]},
+            {"action": "add_nodes_to_network_box", "box": {"ref": "second"}, "nodes": [{"ref": "b"}], "fit": False},
+        ])
+        invalid = self.execute([
+            {"action": "create_network_box", "id": "box", "name": "box"},
+            {"action": "add_nodes_to_network_box", "box": {"ref": "box"}, "nodes": [{"ref": "missing"}]},
+        ])
+
+        first, second = self.parent.boxes[:2]
+        self.assertTrue(result["success"])
+        self.assertEqual([item.name() for item in first.contents], ["A"])
+        self.assertEqual([item.name() for item in second.contents], ["B"])
+        self.assertEqual(first.fit_count, 1)
+        self.assertEqual(second.fit_count, 0)
+        self.assertFalse(invalid["success"])
+        self.assertIn("Unknown symbolic reference", invalid["errors"][0]["message"])
+
+    def test_create_hda_and_install_definition_parameter_interface(self):
+        result = self.execute([
+            {"action": "create_node", "id": "asset", "node_type_name": "subnet", "name": "ROOF_ASSET"},
+            {
+                "action": "create_hda", "node": {"ref": "asset"}, "type_name": "hcb::roof::1.0",
+                "label": "Roof Builder", "file_path": "/tmp/houdini-chat-bridge-tests/roof_builder.hda",
+                "min_inputs": 0, "max_inputs": 1,
+            },
+            {
+                "action": "install_hda_parameter_interface", "node": {"ref": "asset"}, "mode": "replace",
+                "templates": [
+                    {"type": "folder", "name": "main", "label": "Main", "children": [
+                        {"type": "float", "name": "height", "label": "Height", "default": 4.0, "help": "Overall roof height."},
+                        {"type": "int", "name": "segments", "label": "Segments", "default": 4, "min": 1},
+                        {"type": "toggle", "name": "cap", "label": "Create cap", "default": True},
+                        {"type": "string", "name": "material", "label": "Material", "default": "wood"},
+                        {"type": "menu", "name": "style", "label": "Style", "items": ["gable", "flat"], "labels": ["Gable", "Flat"], "default": 0},
+                    ]},
+                ],
+            },
+        ])
+
+        asset = self.parent.children[-1]
+        self.assertTrue(result["success"])
+        self.assertEqual(asset.hda_kwargs["name"], "hcb::roof::1.0")
+        self.assertFalse(asset.hda_definition.options_value.save_spare_parms)
+        self.assertIsNotNone(asset.hda_definition.parameter_group)
+        self.assertEqual(len(asset.hda_definition.parameter_group.templates), 1)
+        folder = asset.hda_definition.parameter_group.templates[0]
+        self.assertEqual(len(folder.kwargs["parm_templates"]), 5)
+
+    def test_descendant_existing_path_is_in_scope_and_expression_language_aliases_work(self):
+        subnet = self.parent.createNode("subnet", "ASSEMBLY")
+        child = subnet.createNode("tube", "POLE")
+        self.hou.nodes[child.path()] = child
+        result = self.execute([
+            {"action": "set_expression", "node": child.path(), "parameter": "height", "expression": "$F", "language": "hscript"},
+        ])
+
+        self.assertTrue(result["success"])
+        self.assertEqual(child.parm("height").expression, "$F")
+
+    def test_hda_creation_requires_a_subnet_source(self):
+        result = self.execute([
+            {
+                "action": "create_hda", "node": "/obj/custom/POLE", "type_name": "hcb::invalid::1.0",
+                "label": "Invalid", "file_path": "/tmp/houdini-chat-bridge-tests/invalid.hda",
+            },
+        ])
+
+        self.assertFalse(result["success"])
+        self.assertIn("must be a subnet", result["errors"][0]["message"])
 
 
 if __name__ == "__main__":

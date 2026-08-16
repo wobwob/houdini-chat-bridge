@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from houdini_chat_bridge.actions import (
+    add_nodes_to_network_box,
     connect_nodes,
     create_network_box,
     create_node,
@@ -18,6 +19,7 @@ from houdini_chat_bridge.actions import (
     set_expression,
     set_parameter,
     set_render_flag,
+    set_node_comment,
 )
 from houdini_chat_bridge.validation import validate_position
 
@@ -53,10 +55,25 @@ class FakeConnection:
 
 
 class FakeNetworkBox:
-    def __init__(self, name):
+    def __init__(self, parent, name):
+        self.parent_value = parent
         self.name = name
         self.comment = None
         self.color = None
+        self.contents = []
+        self.fit_count = 0
+
+    def parent(self):
+        return self.parent_value
+
+    def items(self):
+        return list(self.contents)
+
+    def addItem(self, item):
+        self.contents.append(item)
+
+    def fitAroundContents(self):
+        self.fit_count += 1
 
     def setComment(self, comment):
         self.comment = comment
@@ -78,7 +95,7 @@ class FakeStickyNote:
 
 
 class FakeNode:
-    def __init__(self, path, parameters=None):
+    def __init__(self, path, parameters=None, parent=None):
         self.path_value = path
         self.parameters = parameters or {}
         self.inputs = []
@@ -89,6 +106,8 @@ class FakeNode:
         self.render = False
         self.boxes = []
         self.notes = []
+        self.parent_value = parent
+        self.comment = ""
 
     def isValid(self):
         return True
@@ -102,8 +121,11 @@ class FakeNode:
     def parm(self, name):
         return self.parameters.get(name)
 
+    def parent(self):
+        return self.parent_value
+
     def createNode(self, node_type_name, name):
-        child = FakeNode("%s/%s" % (self.path_value, name or node_type_name))
+        child = FakeNode("%s/%s" % (self.path_value, name or node_type_name), parent=self)
         child.node_type_name = node_type_name
         self.created.append(child)
         return child
@@ -132,7 +154,7 @@ class FakeNode:
         self.render = enabled
 
     def createNetworkBox(self, name):
-        box = FakeNetworkBox(name)
+        box = FakeNetworkBox(self, name)
         self.boxes.append(box)
         return box
 
@@ -140,6 +162,9 @@ class FakeNode:
         note = FakeStickyNote()
         self.notes.append(note)
         return note
+
+    def setComment(self, comment):
+        self.comment = comment
 
 
 class ActionTests(unittest.TestCase):
@@ -214,6 +239,22 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(note.text, "Keep this branch intact.")
         self.assertEqual(note.name, "preserve_branch")
         self.assertEqual(parent.children, [])
+
+    def test_comments_and_network_box_membership_are_explicit_and_safe(self):
+        parent = FakeNode("/obj/custom")
+        first = FakeNode("/obj/custom/FIRST", parent=parent)
+        second = FakeNode("/obj/custom/SECOND", parent=parent)
+        elsewhere = FakeNode("/obj/other/OUTSIDE", parent=FakeNode("/obj/other"))
+        box = create_network_box(parent, name="group")
+
+        self.assertIs(set_node_comment(first, "Keep this."), first)
+        self.assertEqual(first.comment, "Keep this.")
+        add_nodes_to_network_box(box, [first, second])
+        add_nodes_to_network_box(box, [first])
+        self.assertEqual(box.contents, [first, second])
+        self.assertEqual(box.fit_count, 2)
+        with self.assertRaisesRegex(RuntimeError, "not network box parent"):
+            add_nodes_to_network_box(box, [elsewhere])
 
     def test_validation_rejects_invalid_position_and_path_as_a_name(self):
         parent = FakeNode("/obj/custom")

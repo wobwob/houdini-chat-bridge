@@ -155,6 +155,18 @@ class SnapshotDiffTests(unittest.TestCase):
         self.assertIn("PROFILE input 0: BODY[0] -> ROOF_TAPER[0]", result)
         self.assertIn("Deleted:\n- OBSOLETE", result)
 
+    def test_detects_and_formats_comment_changes(self):
+        before, after = fixtures()
+        before["nodes"][0]["comment"] = "Old note"
+        after["nodes"][0]["comment"] = "New note"
+
+        result = compare_snapshots(before, after)
+
+        self.assertEqual(result["comment_changes"], [{
+            "node": "/obj/build/body", "before": "Old note", "after": "New note", "node_name": "BODY",
+        }])
+        self.assertIn("Comments:\n- BODY: 'Old note' -> 'New note'", format_diff(result))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
     parameter_changes: list[dict[str, Any]] = []
     connection_changes: list[dict[str, Any]] = []
     flag_changes: list[dict[str, Any]] = []
+    comment_changes: list[dict[str, Any]] = []
     modified: dict[str, dict[str, Any]] = {}
 
     for path in sorted(before_paths & after_paths):
@@ -30,12 +31,14 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
         parameters = _parameter_changes(path, before_node, after_node)
         connections = _connection_changes(path, before_node, after_node)
         flags = _flag_changes(path, before_node, after_node)
-        _add_display_names(parameters, connections, flags, before_nodes, after_nodes)
+        comments = _comment_changes(path, before_node, after_node)
+        _add_display_names(parameters, connections, flags + comments, before_nodes, after_nodes)
 
         parameter_changes.extend(parameters)
         connection_changes.extend(connections)
         flag_changes.extend(flags)
-        if node_changes or parameters or connections or flags:
+        comment_changes.extend(comments)
+        if node_changes or parameters or connections or flags or comments:
             modified[path] = {
                 "node": path,
                 "node_name": after_node.get("name") or before_node.get("name"),
@@ -43,6 +46,7 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
                 "parameter_changes": parameters,
                 "connection_changes": connections,
                 "flag_changes": flags,
+                "comment_changes": comments,
             }
 
     return {
@@ -52,6 +56,7 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
         "parameter_changes": parameter_changes,
         "connection_changes": connection_changes,
         "flag_changes": flag_changes,
+        "comment_changes": comment_changes,
     }
 
 
@@ -68,6 +73,8 @@ def format_diff(diff: Mapping[str, Any]) -> str:
     _append_connection_changes(lines, diff.get("connection_changes"))
     lines.extend(["", "Flags:"])
     _append_flag_changes(lines, diff.get("flag_changes"))
+    lines.extend(["", "Comments:"])
+    _append_comment_changes(lines, diff.get("comment_changes"))
     lines.extend(["", "Deleted:"])
     _append_node_list(lines, diff.get("deleted_nodes"))
     return "\n".join(lines)
@@ -149,6 +156,16 @@ def _flag_changes(
         if previous is not None and current is not None and previous != current:
             changes.append({"node": path, "flag": flag, "before": previous, "after": current})
     return changes
+
+
+def _comment_changes(
+    path: str, before: Mapping[str, Any], after: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    previous = before.get("comment")
+    current = after.get("comment")
+    if previous == current:
+        return []
+    return [{"node": path, "before": previous, "after": current}]
 
 
 def _named_index(value: Any, label: str, path: str) -> dict[str, Mapping[str, Any]]:
@@ -262,6 +279,18 @@ def _append_flag_changes(lines: list[str], changes: Any) -> None:
             flag = str(change.get("flag", "flag")).replace("_flag", "")
             lines.append("- %s %s: %s -> %s" % (
                 _node_label(change), flag, change.get("before"), change.get("after"),
+            ))
+
+
+def _append_comment_changes(lines: list[str], changes: Any) -> None:
+    valid_changes = changes if isinstance(changes, list) else []
+    if not valid_changes:
+        lines.append("- none")
+        return
+    for change in valid_changes:
+        if isinstance(change, Mapping):
+            lines.append("- %s: %r -> %r" % (
+                _node_label(change), change.get("before"), change.get("after"),
             ))
 
 

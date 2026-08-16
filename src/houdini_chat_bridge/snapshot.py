@@ -10,15 +10,19 @@ from .context import inspect_node
 SNAPSHOT_SCHEMA_VERSION = 1
 
 
-def snapshot_network(parent_or_nodes: Any) -> dict[str, Any]:
-    """Create a stable snapshot of a network parent's direct children or nodes.
+def snapshot_network(parent_or_nodes: Any, *, recursive: bool = False) -> dict[str, Any]:
+    """Create a stable snapshot of a network parent's children or supplied nodes.
 
     Pass a Houdini network node to snapshot its direct children, or pass an
     iterable of nodes to snapshot precisely those nodes. The result excludes
-    UI-oriented and time-dependent inspection fields such as position, comment,
-    output connections, and evaluated values for expression-driven parameters.
+    Set ``recursive=True`` to include all descendants of a supplied network
+    parent. The result excludes UI-oriented and time-dependent inspection
+    fields such as position and output connections. Node comments are retained
+    because the bridge can now change them deliberately.
     """
     nodes, root_path = _resolve_nodes(parent_or_nodes)
+    if recursive:
+        nodes = _collect_descendants(nodes)
     snapshots: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
 
@@ -69,9 +73,35 @@ def _snapshot_node(inspected: dict[str, Any]) -> dict[str, Any]:
         "type_category": _text(inspected.get("type_category")),
         "display_flag": _bool_or_none(inspected.get("display_flag")),
         "render_flag": _bool_or_none(inspected.get("render_flag")),
+        "comment": _text(inspected.get("comment")),
         "input_connections": _snapshot_inputs(inspected.get("input_connections")),
         "parameters": _snapshot_parameters(inspected.get("parameters")),
     }
+
+
+def _collect_descendants(nodes: list[Any]) -> list[Any]:
+    """Return supplied nodes and their descendants once, in stable path order."""
+    collected: list[Any] = []
+    seen: set[str] = set()
+
+    def visit(node: Any) -> None:
+        path = _text(_call(node, "path"))
+        key = path if path is not None else "<object:%d>" % id(node)
+        if key in seen:
+            return
+        seen.add(key)
+        collected.append(node)
+        children = _as_list(_call(node, "children"))
+        for child in sorted(children, key=_node_sort_key):
+            visit(child)
+
+    for node in sorted(nodes, key=_node_sort_key):
+        visit(node)
+    return collected
+
+
+def _node_sort_key(node: Any) -> str:
+    return _text(_call(node, "path")) or "<object:%d>" % id(node)
 
 
 def _snapshot_inputs(value: Any) -> list[dict[str, Any]]:
