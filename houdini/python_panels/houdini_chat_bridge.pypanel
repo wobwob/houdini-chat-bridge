@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <interface name="houdini_chat_bridge" label="Houdini Chat Bridge" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[
+import importlib
+
+from houdini_chat_bridge import panel
+
+panel = importlib.reload(panel)
+_widget = None
+
+
+def onCreateInterface():
+    global _widget
+    _widget = panel.create_panel()
+    return _widget
+
+
+def onNodePathChanged(node):
+    if _widget is not None:
+        _widget.refresh_context()
+]]></script>
+    <includeInPaneTabMenu menu_position="0" create_separator="true"/>
+    <includeInToolbarMenu menu_position="0" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>
