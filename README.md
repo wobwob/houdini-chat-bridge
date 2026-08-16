@@ -5,14 +5,16 @@ conversational AI to inspect and safely modify SideFX Houdini SOP networks.
 
 ## Current scope
 
-This repository currently implements Milestone 1: structured, read-only
-Houdini network inspection. It intentionally does **not** implement OpenAI
-APIs, MCP, LLM or chat integration, network requests, modification operations,
-or a Houdini Python Panel.
+This repository currently implements Milestone 2: structured, read-only
+Houdini network inspection plus stable snapshots and pure-Python diffs. It
+intentionally does **not** implement OpenAI APIs, MCP, LLM or chat integration,
+network requests, modification operations, or a Houdini Python Panel.
 
 `context.py` exposes inspection of individual nodes, selections, upstream
-networks, and the current network-editor context. `formatting.py` turns those
-structured results into readable context without querying Houdini itself.
+networks, and the current network-editor context. `snapshot.py` converts
+inspection into stable network data, while `diff.py` compares snapshots without
+Houdini and formats the resulting change report. `formatting.py` turns context
+data into readable text without querying Houdini itself.
 
 ## Intended architecture
 
@@ -55,4 +57,4 @@ scripts/                  Development utilities
 tests/                    Pure Python unit tests
 ```
 
-Milestone 1 has not started.
+Milestone 2 is complete. Scene modification remains out of scope.
