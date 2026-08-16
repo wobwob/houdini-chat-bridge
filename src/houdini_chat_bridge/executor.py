@@ -1,4 +1,9 @@
-"""Validated batch execution for the explicit Houdini action set."""
+"""Validated batch execution for the explicit Houdini action set.
+
+The executor accepts existing-node paths scoped to one network and symbolic
+references to nodes created earlier in the same batch. It never interprets
+arbitrary Python or dispatches arbitrary function names.
+"""
 
 from __future__ import annotations
 
@@ -45,11 +50,13 @@ def execute_operations(
     label: str = DEFAULT_LABEL,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Validate and execute supported operations as one Houdini undo group.
+    """Run supported operations in one undo group and return their scene diff.
 
-    ``parent`` defines the direct-network snapshot scope. On a runtime failure,
-    completed actions are not hidden or automatically reverted; they remain in
-    the one undo group and the returned diff describes the partial result.
+    ``parent`` is the only execution scope. Existing-node references must be
+    direct children of it. A batch-local node reference has the form
+    ``{"ref": "id"}``, where ``id`` was declared by an earlier
+    ``create_node`` operation. A runtime failure leaves completed work in the
+    one undoable Houdini group and reports the partial diff.
     """
     requested, input_error = _normalise_operations(operations)
     result = _result(label, requested)
@@ -64,13 +71,13 @@ def execute_operations(
         return result
 
     try:
-        require_valid_node(parent, "snapshot parent")
+        parent = require_network_parent(parent)
         hou = _get_hou()
     except (RuntimeError, ValueError) as error:
         result["errors"].append(_error_record(None, None, str(error)))
         return result
 
-    plans, validation_errors = _validate_batch(hou, requested)
+    plans, validation_errors = _preflight_batch(hou, parent, requested)
     if validation_errors:
         result["errors"].extend(validation_errors)
         return result
@@ -84,11 +91,12 @@ def execute_operations(
         result["errors"].append(_error_record(None, None, "Could not capture before snapshot: %s" % error))
         return result
 
+    created: dict[str, Any] = {}
     try:
         with _undo_group(hou, label):
             for plan in plans:
                 try:
-                    _dispatch(plan, hou)
+                    _dispatch(plan, hou, parent, created)
                 except Exception as error:
                     result["errors"].append(_error_record(plan["index"], plan["action"], str(error)))
                     break
@@ -143,130 +151,288 @@ def _empty_diff() -> dict[str, list[Any]]:
     }
 
 
-def _validate_batch(hou: Any, operations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _preflight_batch(
+    hou: Any, parent: Any, operations: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate structure, IDs, scoped existing nodes, and known current state."""
+    declared_ids = _declared_ids(operations)
+    available_ids: set[str] = set()
+    seen_ids: set[str] = set()
     plans: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+
     for index, operation in enumerate(operations):
         action = operation.get("action")
         try:
-            _validate_operation(hou, operation)
+            created_id = _preflight_operation(
+                hou, parent, operation, declared_ids, available_ids, seen_ids
+            )
         except (RuntimeError, ValueError) as error:
             errors.append(_error_record(index, action if isinstance(action, str) else None, str(error)))
-        else:
-            plans.append({"index": index, "action": action, "operation": operation})
+            continue
+        if created_id is not None:
+            available_ids.add(created_id)
+            seen_ids.add(created_id)
+        plans.append({"index": index, "action": action, "operation": operation})
     return plans, errors
 
 
-def _validate_operation(hou: Any, operation: Mapping[str, Any]) -> None:
+def _declared_ids(operations: list[dict[str, Any]]) -> set[str]:
+    return {
+        operation["id"]
+        for operation in operations
+        if operation.get("action") == "create_node" and isinstance(operation.get("id"), str)
+    }
+
+
+def _preflight_operation(
+    hou: Any,
+    parent: Any,
+    operation: Mapping[str, Any],
+    declared_ids: set[str],
+    available_ids: set[str],
+    seen_ids: set[str],
+) -> str | None:
     action = operation.get("action")
     if not isinstance(action, str) or action not in _SUPPORTED_ACTIONS:
         raise ValueError("Unsupported action %r." % action)
 
     if action == "create_node":
-        _check_fields(operation, action, {"parent", "node_type_name"}, {"name", "position"})
-        require_network_parent(_node_from_operation(hou, operation, "parent"))
+        _check_fields(operation, action, {"node_type_name"}, {"id", "name", "position"})
         validate_node_type_name(operation["node_type_name"])
         validate_node_name(operation.get("name"))
         validate_position(operation.get("position"))
-    elif action == "set_parameter":
+        created_id = _operation_id(operation)
+        if created_id is not None and created_id in seen_ids:
+            raise ValueError("Duplicate create_node id %r." % created_id)
+        return created_id
+
+    if action == "set_parameter":
         _check_fields(operation, action, {"node", "parameter", "value"}, set())
-        require_parameter(_node_from_operation(hou, operation, "node"), operation["parameter"])
-    elif action == "set_expression":
+        node = _preflight_target(hou, parent, operation["node"], "node", declared_ids, available_ids)
+        if node is not None:
+            require_parameter(node, operation["parameter"])
+        return None
+
+    if action == "set_expression":
         _check_fields(operation, action, {"node", "parameter", "expression"}, {"language"})
-        require_parameter(_node_from_operation(hou, operation, "node"), operation["parameter"])
+        node = _preflight_target(hou, parent, operation["node"], "node", declared_ids, available_ids)
+        if node is not None:
+            require_parameter(node, operation["parameter"])
         validate_expression(operation["expression"])
         _expression_language(hou, operation.get("language"))
-    elif action == "connect_nodes":
+        return None
+
+    if action == "connect_nodes":
         _check_fields(operation, action, {"source", "target"}, {"input_index", "output_index", "replace_existing"})
-        source = require_valid_node(_node_from_operation(hou, operation, "source"), "source node")
-        target = require_valid_node(_node_from_operation(hou, operation, "target"), "target node")
-        validate_port_index(operation.get("input_index", 0), "input index", target, "inputCount")
-        validate_port_index(operation.get("output_index", 0), "output index", source, "outputCount")
-        if not isinstance(operation.get("replace_existing", False), bool):
-            raise ValueError("replace_existing must be a boolean.")
-        existing = input_connection(target, operation.get("input_index", 0))
-        if existing is not None and not operation.get("replace_existing", False):
-            if not _matches_connection(existing, source, operation.get("output_index", 0)):
-                raise RuntimeError(
-                    "Target node %s input %d is already connected; pass replace_existing=True to replace it."
-                    % (node_label(target), operation.get("input_index", 0))
-                )
-    elif action == "disconnect_input":
+        source = _preflight_target(hou, parent, operation["source"], "source", declared_ids, available_ids)
+        target = _preflight_target(hou, parent, operation["target"], "target", declared_ids, available_ids)
+        _validate_connection_fields(operation, source, target)
+        return None
+
+    if action == "disconnect_input":
         _check_fields(operation, action, {"target"}, {"input_index"})
-        target = require_valid_node(_node_from_operation(hou, operation, "target"), "target node")
-        validate_port_index(operation.get("input_index", 0), "input index", target, "inputCount")
-        if input_connection(target, operation.get("input_index", 0)) is None:
+        target = _preflight_target(hou, parent, operation["target"], "target", declared_ids, available_ids)
+        _validate_input_index(operation.get("input_index", 0), target)
+        if target is not None and input_connection(target, operation.get("input_index", 0)) is None:
             raise RuntimeError(
                 "Target node %s input %d is not connected."
                 % (node_label(target), operation.get("input_index", 0))
             )
-    elif action in {"set_display_flag", "set_render_flag"}:
+        return None
+
+    if action in {"set_display_flag", "set_render_flag"}:
         _check_fields(operation, action, {"node", "enabled"}, set())
-        require_valid_node(_node_from_operation(hou, operation, "node"))
+        _preflight_target(hou, parent, operation["node"], "node", declared_ids, available_ids)
         validate_flag_value(operation["enabled"], "enabled")
-    elif action == "create_network_box":
-        _check_fields(operation, action, {"parent"}, {"name", "comment"})
-        require_network_parent(_node_from_operation(hou, operation, "parent"))
+        return None
+
+    if action == "create_network_box":
+        _check_fields(operation, action, set(), {"name", "comment"})
         validate_node_name(operation.get("name"))
         if "comment" in operation:
             validate_text(operation["comment"], "comment")
-    elif action == "create_sticky_note":
-        _check_fields(operation, action, {"parent", "text"}, {"name"})
-        require_network_parent(_node_from_operation(hou, operation, "parent"))
+        return None
+
+    if action == "create_sticky_note":
+        _check_fields(operation, action, {"text"}, {"name"})
         validate_text(operation["text"], "text")
         validate_node_name(operation.get("name"))
+        return None
+
+    raise RuntimeError("Unsupported action %r." % action)
 
 
-def _dispatch(plan: Mapping[str, Any], hou: Any) -> Any:
+def _preflight_target(
+    hou: Any,
+    parent: Any,
+    reference: Any,
+    field_name: str,
+    declared_ids: set[str],
+    available_ids: set[str],
+) -> Any | None:
+    reference_id = _reference_id(reference)
+    if reference_id is not None:
+        if reference_id not in declared_ids:
+            raise ValueError("Unknown symbolic reference %r in field %r." % (reference_id, field_name))
+        if reference_id not in available_ids:
+            raise ValueError(
+                "Forward symbolic reference %r in field %r; create it earlier in the batch."
+                % (reference_id, field_name)
+            )
+        return None
+    return _scoped_node_from_path(hou, parent, reference, field_name)
+
+
+def _dispatch(plan: Mapping[str, Any], hou: Any, parent: Any, created: dict[str, Any]) -> Any:
     operation = plan["operation"]
     action = plan["action"]
     if action == "create_node":
-        return actions.create_node(
-            _node_from_operation(hou, operation, "parent"),
+        node = actions.create_node(
+            parent,
             operation["node_type_name"],
             name=operation.get("name"),
             position=operation.get("position"),
         )
+        created_id = _operation_id(operation)
+        if created_id is not None:
+            created[created_id] = node
+        return node
     if action == "set_parameter":
         return actions.set_parameter(
-            _node_from_operation(hou, operation, "node"), operation["parameter"], operation["value"]
+            _runtime_target(hou, parent, created, operation["node"], "node"),
+            operation["parameter"],
+            operation["value"],
         )
     if action == "set_expression":
         return actions.set_expression(
-            _node_from_operation(hou, operation, "node"),
+            _runtime_target(hou, parent, created, operation["node"], "node"),
             operation["parameter"],
             operation["expression"],
             language=_expression_language(hou, operation.get("language")),
         )
     if action == "connect_nodes":
         return actions.connect_nodes(
-            _node_from_operation(hou, operation, "source"),
-            _node_from_operation(hou, operation, "target"),
+            _runtime_target(hou, parent, created, operation["source"], "source"),
+            _runtime_target(hou, parent, created, operation["target"], "target"),
             input_index=operation.get("input_index", 0),
             output_index=operation.get("output_index", 0),
             replace_existing=operation.get("replace_existing", False),
         )
     if action == "disconnect_input":
         return actions.disconnect_input(
-            _node_from_operation(hou, operation, "target"), operation.get("input_index", 0)
+            _runtime_target(hou, parent, created, operation["target"], "target"),
+            operation.get("input_index", 0),
         )
     if action == "set_display_flag":
-        return actions.set_display_flag(_node_from_operation(hou, operation, "node"), operation["enabled"])
+        return actions.set_display_flag(
+            _runtime_target(hou, parent, created, operation["node"], "node"), operation["enabled"]
+        )
     if action == "set_render_flag":
-        return actions.set_render_flag(_node_from_operation(hou, operation, "node"), operation["enabled"])
+        return actions.set_render_flag(
+            _runtime_target(hou, parent, created, operation["node"], "node"), operation["enabled"]
+        )
     if action == "create_network_box":
-        return actions.create_network_box(
-            _node_from_operation(hou, operation, "parent"),
-            name=operation.get("name"),
-            comment=operation.get("comment"),
-        )
+        return actions.create_network_box(parent, name=operation.get("name"), comment=operation.get("comment"))
     if action == "create_sticky_note":
-        return actions.create_sticky_note(
-            _node_from_operation(hou, operation, "parent"),
-            operation["text"],
-            name=operation.get("name"),
-        )
+        return actions.create_sticky_note(parent, operation["text"], name=operation.get("name"))
     raise RuntimeError("Unsupported action %r." % action)
+
+
+def _runtime_target(hou: Any, parent: Any, created: Mapping[str, Any], reference: Any, field_name: str) -> Any:
+    reference_id = _reference_id(reference)
+    if reference_id is not None:
+        try:
+            node = created[reference_id]
+        except KeyError as error:
+            raise RuntimeError("Symbolic reference %r is unavailable at execution time." % reference_id) from error
+        return require_valid_node(node, "%s node" % field_name)
+    return _scoped_node_from_path(hou, parent, reference, field_name)
+
+
+def _validate_connection_fields(operation: Mapping[str, Any], source: Any | None, target: Any | None) -> None:
+    input_index = operation.get("input_index", 0)
+    output_index = operation.get("output_index", 0)
+    _validate_input_index(input_index, target)
+    _validate_output_index(output_index, source)
+    if not isinstance(operation.get("replace_existing", False), bool):
+        raise ValueError("replace_existing must be a boolean.")
+    if source is None or target is None:
+        return
+    existing = input_connection(target, input_index)
+    if existing is not None and not operation.get("replace_existing", False):
+        if not _matches_connection(existing, source, output_index):
+            raise RuntimeError(
+                "Target node %s input %d is already connected; pass replace_existing=True to replace it."
+                % (node_label(target), input_index)
+            )
+
+
+def _validate_input_index(index: Any, target: Any | None) -> None:
+    if target is None:
+        _validate_nonnegative_index(index, "input index")
+    else:
+        validate_port_index(index, "input index", target, "inputCount")
+
+
+def _validate_output_index(index: Any, source: Any | None) -> None:
+    if source is None:
+        _validate_nonnegative_index(index, "output index")
+    else:
+        validate_port_index(index, "output index", source, "outputCount")
+
+
+def _validate_nonnegative_index(index: Any, label: str) -> None:
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise ValueError("%s must be a non-negative integer." % label)
+
+
+def _scoped_node_from_path(hou: Any, parent: Any, path: Any, field_name: str) -> Any:
+    if not isinstance(path, str) or not path:
+        raise ValueError(
+            "Action field %r must be an existing scoped node path string or {'ref': 'id'}." % field_name
+        )
+    try:
+        node = hou.node(path)
+    except Exception as error:
+        raise RuntimeError("Could not resolve %s node path %r." % (field_name, path)) from error
+    if node is None:
+        raise RuntimeError("%s node does not exist: %s." % (field_name.capitalize(), path))
+    require_valid_node(node, "%s node" % field_name)
+    _require_scope(node, parent, field_name)
+    return node
+
+
+def _require_scope(node: Any, parent: Any, field_name: str) -> None:
+    try:
+        node_parent = node.parent()
+    except Exception as error:
+        raise RuntimeError("Could not determine parent of %s node %s." % (field_name, node_label(node))) from error
+    if node_label(node_parent) != node_label(parent):
+        raise RuntimeError(
+            "%s node %s is outside execution scope %s."
+            % (field_name.capitalize(), node_label(node), node_label(parent))
+        )
+
+
+def _operation_id(operation: Mapping[str, Any]) -> str | None:
+    if "id" not in operation:
+        return None
+    value = operation["id"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("create_node id must be a non-empty string.")
+    return value
+
+
+def _reference_id(reference: Any) -> str | None:
+    if not isinstance(reference, Mapping):
+        return None
+    if set(reference) != {"ref"}:
+        raise ValueError("Symbolic references must contain only {'ref': 'id'}.")
+    value = reference.get("ref")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Symbolic reference id must be a non-empty string.")
+    return value
 
 
 def _check_fields(
@@ -278,19 +444,6 @@ def _check_fields(
     unknown = sorted(set(operation) - {"action"} - required - optional)
     if unknown:
         raise ValueError("Action %r contains unsupported field(s): %s." % (action, ", ".join(unknown)))
-
-
-def _node_from_operation(hou: Any, operation: Mapping[str, Any], field_name: str) -> Any:
-    path = operation.get(field_name)
-    if not isinstance(path, str) or not path:
-        raise ValueError("Action field %r must be a non-empty node path string." % field_name)
-    try:
-        node = hou.node(path)
-    except Exception as error:
-        raise RuntimeError("Could not resolve %s node path %r." % (field_name, path)) from error
-    if node is None:
-        raise RuntimeError("%s node does not exist: %s." % (field_name.capitalize(), path))
-    return node
 
 
 def _expression_language(hou: Any, language: Any) -> Any:

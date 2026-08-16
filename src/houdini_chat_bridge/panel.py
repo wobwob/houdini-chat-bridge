@@ -276,8 +276,14 @@ def _selectable_label(text: str) -> QtWidgets.QLabel:
 def _operation_placeholder() -> str:
     return """[
   {
+    \"action\": \"create_node\",
+    \"id\": \"pole\",
+    \"node_type_name\": \"tube\",
+    \"name\": \"POLE\"
+  },
+  {
     \"action\": \"set_parameter\",
-    \"node\": \"/path/to/POLE\",
+    \"node\": {\"ref\": \"pole\"},
     \"parameter\": \"height\",
     \"value\": 5.0
   }

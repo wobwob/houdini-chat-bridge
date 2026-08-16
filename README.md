@@ -26,6 +26,60 @@ copies already-structured context, decodes manually entered operation JSON, and
 delegates validation/execution to `executor.py`. It contains no bridge business
 logic and never executes clipboard contents automatically.
 
+## Operation batch references and scope
+
+The executor accepts only the explicitly supported action schemas. It supports
+two node-target representations:
+
+- An existing node path string, such as `"/your/network/EXISTING"`.
+- A batch-local reference object, such as `{"ref": "pole"}`.
+
+Declare a batch-local ID only on `create_node`. Created nodes always belong to
+the `parent` supplied to `execute_operations()` (the current network in the
+Python Panel); `create_node` no longer accepts an operation-level parent path.
+The executor stores the `hou.Node` returned by the creation action, so later
+operations never reconstruct a node path from the requested instance name.
+
+```json
+[
+  {
+    "action": "create_node",
+    "id": "pole",
+    "node_type_name": "tube",
+    "name": "POLE"
+  },
+  {
+    "action": "set_parameter",
+    "node": {"ref": "pole"},
+    "parameter": "height",
+    "value": 5.0
+  },
+  {
+    "action": "create_node",
+    "id": "out",
+    "node_type_name": "null",
+    "name": "OUT"
+  },
+  {
+    "action": "connect_nodes",
+    "source": {"ref": "pole"},
+    "target": {"ref": "out"}
+  }
+]
+```
+
+`set_parameter`, `set_expression`, `connect_nodes`, `disconnect_input`,
+`set_display_flag`, and `set_render_flag` accept the same reference object.
+References must name a unique `create_node` ID declared earlier in the same
+batch. Duplicate, unknown, and forward references are rejected before scene
+modification.
+
+For safety, an explicit existing-node path must resolve to a direct child of
+the supplied execution parent. Operations cannot target unrelated networks.
+Preflight checks validate batch structure, IDs, scoped existing nodes, and
+currently knowable scene state. Validation that depends on a newly created node
+is performed when that operation runs inside the batch's single undo group.
+
 ## Intended architecture
 
 | Module | Responsibility |
@@ -77,14 +131,20 @@ the package and discover the `.pypanel` definition.
    network, selection, and display node are shown.
 4. Click **Copy Selected Context** and **Copy Upstream Context** with a node
    selected; paste the results into a text editor to confirm they are readable.
-5. In **PATCH EXECUTION**, enter a JSON list using real paths from the current
-   network, for example:
+5. In **PATCH EXECUTION**, enter a JSON list. Use symbolic references for nodes
+   created earlier in the same batch, for example:
 
    ```json
    [
      {
+       "action": "create_node",
+       "id": "pole",
+       "node_type_name": "tube",
+       "name": "POLE"
+     },
+     {
        "action": "set_parameter",
-       "node": "/your/network/POLE",
+       "node": {"ref": "pole"},
        "parameter": "height",
        "value": 5.0
      }
