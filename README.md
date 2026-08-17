@@ -28,11 +28,14 @@ logic and never executes clipboard contents automatically.
 
 ## Operation batches, symbolic objects, and scope
 
-The executor accepts only explicit, documented action schemas. It supports an
-existing node path string and a batch-local reference object:
+The executor accepts only explicit, documented action schemas. Node-reference
+objects keep same-batch IDs distinct from nodes already in Houdini:
 
-- An existing node path string, such as `"/your/network/EXISTING"`.
-- A batch-local reference object, such as `{"ref": "pole"}`.
+- Same PATCH: `{"ref": "pole"}` resolves the object stored under the
+  earlier batch ID `pole`.
+- Already in Houdini: `{"path": "HOUSE_BODY"}` resolves from the current
+  execution parent; `{"path": "./HOUSE_BODY"}` is also valid. Absolute paths
+  remain supported, such as `{"path": "/obj/build/HOUSE_BODY"}`.
 
 `create_node` declares a node ID and `create_network_box` declares a
 network-box ID. All IDs share one namespace. The executor stores the HOM object
@@ -42,9 +45,12 @@ cannot be used where a node is required.
 
 `create_node`, `create_network_box`, and `create_sticky_note` take an optional
 `parent`. Omit it to use the `parent` passed to `execute_operations()`, pass an
-existing in-scope network path, or pass a node reference created earlier in the
-batch. Existing paths are restricted to that root network or its descendants;
-the bridge cannot reach unrelated networks through arbitrary paths.
+existing in-scope `{"path": "..."}` reference, or pass a node reference
+created earlier in the batch. Relative `path` values are normalized from that
+root network, and all existing paths are restricted to the root or its
+descendants; the bridge cannot reach unrelated networks through arbitrary
+paths. Legacy plain-string existing paths remain supported for compatibility,
+but new PATCHes should use explicit `ref` and `path` objects.
 
 References must name a unique object ID declared earlier in the same batch.
 Duplicate, unknown, and forward references are rejected before scene
@@ -58,7 +64,8 @@ Supported actions are:
   `disconnect_input`, `set_display_flag`, `set_render_flag`, and
   `set_node_comment`.
 - `create_network_box`, `add_nodes_to_network_box`, and `create_sticky_note`.
-- `create_hda` and `install_hda_parameter_interface`.
+- `create_hda`, `install_hda_parameter_interface`, and
+  `install_node_parameter_interface`.
 
 The HDA parameter interface accepts `mode: "replace"` and a declarative
 `templates` list. Supported template types are `folder`, `float`, `int`,
@@ -67,6 +74,48 @@ The HDA parameter interface accepts `mode: "replace"` and a declarative
 The interface is installed on the HDA definition, never as spare parameters on
 the HDA node or an internal controller Null. The HDA actions disable saving
 spare parameters on the definition.
+
+### Normal-node spare parameter interfaces
+
+`install_node_parameter_interface` adds or updates **Spare parameters** on an
+ordinary Houdini node, such as a temporary controller Null. It is distinct
+from `install_hda_parameter_interface`, which edits an HDA definition. The
+action merges named templates into the node's existing parameter-template
+group, preserving its built-in parameter interface and unrelated spare
+parameters.
+
+```json
+{
+  "action": "install_node_parameter_interface",
+  "node": "controls",
+  "templates": [
+    {
+      "type": "folder",
+      "name": "dimensions",
+      "label": "Dimensions",
+      "children": [
+        {
+          "type": "float",
+          "name": "house_width",
+          "label": "House Width",
+          "default": 5.0,
+          "min": 2.0,
+          "max": 12.0,
+          "min_strict": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+`node` accepts an in-scope `{"path": "..."}` node path or a node created
+earlier in the batch. For compatibility, that earlier ID may also be written
+directly as `"controls"`; new PATCHes should use `{"ref": "controls"}`.
+Supported templates are
+recursive `folder` containers plus scalar `float`, `int`, `toggle`, `string`,
+and ordered `menu` controls. Numeric range strictness uses `min_strict` and
+`max_strict`; menu items are `{ "value": "...", "label": "..." }` objects.
 
 Here is a complete procedural/HDA batch. It creates a subnet, builds its
 contents using symbolic parents, comments a node, groups the internal nodes in

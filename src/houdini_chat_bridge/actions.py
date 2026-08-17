@@ -21,6 +21,8 @@ from .validation import (
     validate_expression,
     validate_flag_value,
     validate_hda_parameter_interface,
+    validate_node_parameter_interface,
+    validate_node_parameter_interface_target,
     validate_node_name,
     validate_node_type_name,
     validate_nonnegative_integer,
@@ -319,6 +321,37 @@ def install_hda_parameter_interface(node: Any, templates: list[dict[str, Any]], 
     return node
 
 
+def install_node_parameter_interface(node: Any, templates: list[dict[str, Any]]) -> Any:
+    """Upsert declared spare parameters without replacing the node interface.
+
+    The node's current parameter-template group is retained intact.  Submitted
+    templates replace same-named spare templates and folders merge their
+    children by name, preserving unrelated standard and spare parameters.
+    """
+    templates = validate_node_parameter_interface(templates)
+    node = validate_node_parameter_interface_target(node, templates)
+    hou = _get_hou()
+    try:
+        group = node.parmTemplateGroup()
+        for template in templates:
+            existing = _group_template(group, template["name"])
+            built = _build_node_parm_template(hou, template, existing)
+            if existing is None:
+                group.append(built)
+            else:
+                group.replace(template["name"], built)
+        node.setParmTemplateGroup(group, rename_conflicting_parms=False)
+        _verify_node_parameter_interface(node, templates)
+    except (RuntimeError, ValueError):
+        raise
+    except Exception as error:
+        raise RuntimeError(
+            "install_node_parameter_interface failed on %s (%s: %s)."
+            % (node_label(node), type(error).__name__, error)
+        ) from error
+    return node
+
+
 def _is_same_connection(connection: Any, source: Any, output_index: int) -> bool:
     try:
         return (
@@ -404,6 +437,123 @@ def _build_parm_template(hou: Any, spec: dict[str, Any]) -> Any:
             default_value=spec.get("default", 0), **kwargs
         )
     raise RuntimeError("Unsupported HDA parameter template type %r." % kind)
+
+
+def _build_node_parm_template(hou: Any, spec: dict[str, Any], existing: Any | None = None) -> Any:
+    """Build one scalar spare-parameter template, merging folder children."""
+    kind = spec["type"]
+    if kind == "folder":
+        children = _merge_folder_children(
+            hou, _folder_templates(existing), spec["children"]
+        )
+        folder = hou.FolderParmTemplate(spec["name"], spec["label"])
+        for child in children:
+            folder.addParmTemplate(child)
+        return folder
+    if kind in {"float", "int"}:
+        numeric_kwargs = {
+            "default_value": (
+                (float if kind == "float" else int)(spec.get("default", 0)),
+            ),
+            "min": spec.get("min", 0.0 if kind == "float" else 0),
+            "max": spec.get("max", 10.0 if kind == "float" else 10),
+            "min_is_strict": spec.get("min_strict", False),
+            "max_is_strict": spec.get("max_strict", False),
+        }
+        template_class = hou.FloatParmTemplate if kind == "float" else hou.IntParmTemplate
+        return template_class(spec["name"], spec["label"], 1, **numeric_kwargs)
+    if kind == "toggle":
+        return hou.ToggleParmTemplate(
+            spec["name"], spec["label"], default_value=spec.get("default", False)
+        )
+    if kind == "string":
+        return hou.StringParmTemplate(
+            spec["name"], spec["label"], 1, default_value=(spec.get("default", ""),)
+        )
+    if kind == "menu":
+        values = tuple(item["value"] for item in spec["items"])
+        labels = tuple(item["label"] for item in spec["items"])
+        default = spec.get("default", values[0])
+        return hou.MenuParmTemplate(
+            spec["name"], spec["label"], values,
+            menu_labels=labels, default_value=values.index(default),
+        )
+    raise RuntimeError("Unsupported node parameter template type %r." % kind)
+
+
+def _merge_folder_children(hou: Any, existing: list[Any], submitted: list[dict[str, Any]]) -> list[Any]:
+    merged = list(existing)
+    indices = {
+        name: index for index, template in enumerate(merged)
+        if (name := _template_name(template)) is not None
+    }
+    for spec in submitted:
+        index = indices.get(spec["name"])
+        previous = merged[index] if index is not None else None
+        built = _build_node_parm_template(hou, spec, previous)
+        if index is None:
+            indices[spec["name"]] = len(merged)
+            merged.append(built)
+        else:
+            merged[index] = built
+    return merged
+
+
+def _group_template(group: Any, name: str) -> Any | None:
+    try:
+        return group.find(name)
+    except Exception as error:
+        raise RuntimeError("Could not inspect parameter template %r." % name) from error
+
+
+def _folder_templates(template: Any | None) -> list[Any]:
+    if template is None:
+        return []
+    try:
+        templates = template.parmTemplates()
+    except AttributeError:
+        return []
+    except Exception as error:
+        raise RuntimeError("Could not inspect existing parameter folder contents.") from error
+    try:
+        return list(templates)
+    except TypeError as error:
+        raise RuntimeError("Could not inspect existing parameter folder contents.") from error
+
+
+def _template_name(template: Any) -> str | None:
+    try:
+        name = template.name()
+    except Exception:
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def _verify_node_parameter_interface(node: Any, templates: list[dict[str, Any]]) -> None:
+    """Confirm Houdini installed every requested scalar spare parameter."""
+    for template in templates:
+        for name in _node_interface_leaf_names(template):
+            try:
+                parameter = node.parm(name)
+            except Exception as error:
+                raise RuntimeError(
+                    "Could not verify spare parameter %r on node %s."
+                    % (name, node_label(node))
+                ) from error
+            if parameter is None:
+                raise RuntimeError(
+                    "Spare parameter %r was not installed on node %s."
+                    % (name, node_label(node))
+                )
+
+
+def _node_interface_leaf_names(template: dict[str, Any]) -> list[str]:
+    if template["type"] != "folder":
+        return [template["name"]]
+    names: list[str] = []
+    for child in template["children"]:
+        names.extend(_node_interface_leaf_names(child))
+    return names
 
 
 def _template_common_kwargs(spec: dict[str, Any], *, include_help: bool) -> dict[str, Any]:

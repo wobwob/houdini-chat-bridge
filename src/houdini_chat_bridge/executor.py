@@ -8,6 +8,7 @@ batch-local object identities, structural validation, and dispatch only.
 from __future__ import annotations
 
 import importlib
+import posixpath
 from typing import Any, Mapping
 
 from . import actions
@@ -23,6 +24,8 @@ from .validation import (
     validate_expression,
     validate_flag_value,
     validate_hda_parameter_interface,
+    validate_node_parameter_interface,
+    validate_node_parameter_interface_target,
     validate_node_name,
     validate_node_type_name,
     validate_nonnegative_integer,
@@ -37,7 +40,7 @@ _SUPPORTED_ACTIONS = {
     "create_node", "set_parameter", "set_expression", "connect_nodes",
     "disconnect_input", "set_display_flag", "set_render_flag", "set_node_comment",
     "create_network_box", "add_nodes_to_network_box", "create_sticky_note",
-    "create_hda", "install_hda_parameter_interface",
+    "create_hda", "install_hda_parameter_interface", "install_node_parameter_interface",
 }
 _NODE_SYMBOL = "node"
 _NETWORK_BOX_SYMBOL = "network_box"
@@ -259,6 +262,15 @@ def _preflight_operation(hou: Any, parent: Any, operation: Mapping[str, Any], de
         _preflight_node_target(hou, parent, operation["node"], "node", declared, available)
         validate_hda_parameter_interface(operation["templates"], operation.get("mode", "replace"))
         return None
+    if action == "install_node_parameter_interface":
+        _check_fields(operation, action, {"node", "templates"}, set())
+        node = _preflight_node_interface_target(
+            hou, parent, operation["node"], declared, available
+        )
+        templates = validate_node_parameter_interface(operation["templates"])
+        if node is not None:
+            validate_node_parameter_interface_target(node, templates)
+        return None
     raise RuntimeError("Unsupported action %r." % action)
 
 
@@ -278,11 +290,13 @@ def _preflight_parent(hou: Any, root: Any, reference: Any, declared: Mapping[str
 
 
 def _preflight_node_target(hou: Any, root: Any, reference: Any, field_name: str, declared: Mapping[str, str], available: Mapping[str, str], *, require_network: bool = False) -> Any | None:
-    reference_id = _reference_id(reference)
-    if reference_id is not None:
-        _preflight_symbol(reference_id, _NODE_SYMBOL, field_name, declared, available)
+    kind, value = _node_reference_spec(reference, field_name)
+    if kind == "ref":
+        _preflight_symbol(value, _NODE_SYMBOL, field_name, declared, available)
         return None
-    node = _scoped_node_from_path(hou, root, reference, field_name)
+    node = _scoped_node_from_path(
+        hou, root, value, field_name, relative_to_root=kind == "path"
+    )
     if require_network:
         require_network_parent(node)
     return node
@@ -299,6 +313,12 @@ def _preflight_network_box_target(hou: Any, root: Any, reference: Any, field_nam
 def _preflight_symbol(reference_id: str, expected_kind: str, field_name: str, declared: Mapping[str, str], available: Mapping[str, str]) -> None:
     declared_kind = declared.get(reference_id)
     if declared_kind is None:
+        if expected_kind == _NODE_SYMBOL:
+            raise ValueError(
+                "PATCH node reference does not exist: %s. "
+                "Unknown symbolic reference %r in field %r."
+                % (reference_id, reference_id, field_name)
+            )
         raise ValueError("Unknown symbolic reference %r in field %r." % (reference_id, field_name))
     if declared_kind != expected_kind:
         raise ValueError("Symbolic reference %r in field %r is a %s, not a %s." % (reference_id, field_name, declared_kind, expected_kind))
@@ -342,6 +362,11 @@ def _dispatch(plan: Mapping[str, Any], hou: Any, root: Any, symbols: dict[str, d
         return hda_node
     if action == "install_hda_parameter_interface":
         return actions.install_hda_parameter_interface(_runtime_node(hou, root, symbols, operation["node"], "node"), operation["templates"], mode=operation.get("mode", "replace"))
+    if action == "install_node_parameter_interface":
+        return actions.install_node_parameter_interface(
+            _runtime_node_interface_target(hou, root, symbols, operation["node"]),
+            operation["templates"],
+        )
     raise RuntimeError("Unsupported action %r." % action)
 
 
@@ -363,10 +388,34 @@ def _runtime_parent(hou: Any, root: Any, symbols: Mapping[str, Mapping[str, Any]
 
 
 def _runtime_node(hou: Any, root: Any, symbols: Mapping[str, Mapping[str, Any]], reference: Any, field_name: str) -> Any:
-    reference_id = _reference_id(reference)
-    if reference_id is not None:
-        return _runtime_symbol(symbols, reference_id, _NODE_SYMBOL, field_name)
-    return _scoped_node_from_path(hou, root, reference, field_name)
+    kind, value = _node_reference_spec(reference, field_name)
+    if kind == "ref":
+        return _runtime_symbol(symbols, value, _NODE_SYMBOL, field_name)
+    return _scoped_node_from_path(
+        hou, root, value, field_name, relative_to_root=kind == "path"
+    )
+
+
+def _preflight_node_interface_target(
+    hou: Any,
+    root: Any,
+    reference: Any,
+    declared: Mapping[str, str],
+    available: Mapping[str, str],
+) -> Any | None:
+    """Resolve normal references plus the action's documented plain ID form."""
+    if isinstance(reference, str) and reference in declared:
+        _preflight_symbol(reference, _NODE_SYMBOL, "node", declared, available)
+        return None
+    return _preflight_node_target(hou, root, reference, "node", declared, available)
+
+
+def _runtime_node_interface_target(
+    hou: Any, root: Any, symbols: Mapping[str, Mapping[str, Any]], reference: Any
+) -> Any:
+    if isinstance(reference, str) and reference in symbols:
+        return _runtime_symbol(symbols, reference, _NODE_SYMBOL, "node")
+    return _runtime_node(hou, root, symbols, reference, "node")
 
 
 def _runtime_network_box(hou: Any, root: Any, symbols: Mapping[str, Mapping[str, Any]], reference: Any, field_name: str) -> Any:
@@ -434,18 +483,28 @@ def _validate_nonnegative_index(index: Any, label: str) -> None:
         raise ValueError("%s must be a non-negative integer." % label)
 
 
-def _scoped_node_from_path(hou: Any, root: Any, path: Any, field_name: str) -> Any:
-    if not isinstance(path, str) or not path:
-        raise ValueError("Action field %r must be an existing scoped node path string or {'ref': 'id'}." % field_name)
+def _scoped_node_from_path(
+    hou: Any, root: Any, path: str, field_name: str, *, relative_to_root: bool = False
+) -> Any:
+    resolved_path = _resolve_existing_node_path(root, path) if relative_to_root else path
     try:
-        node = hou.node(path)
+        node = hou.node(resolved_path)
     except Exception as error:
-        raise RuntimeError("Could not resolve %s node path %r." % (field_name, path)) from error
+        raise RuntimeError("Could not resolve existing %s node path %r." % (field_name, path)) from error
     if node is None:
-        raise RuntimeError("%s node does not exist: %s." % (field_name.capitalize(), path))
+        raise RuntimeError("Existing node does not exist: %s." % path)
     require_valid_node(node, "%s node" % field_name)
     _require_scope(node, root, field_name)
     return node
+
+
+def _resolve_existing_node_path(root: Any, path: str) -> str:
+    if path.startswith("/"):
+        return path
+    root_path = node_label(root)
+    if not root_path.startswith("/"):
+        raise RuntimeError("Could not resolve relative node path %r from %s." % (path, root_path))
+    return posixpath.normpath(posixpath.join(root_path, path))
 
 
 def _scoped_network_box_by_name(root: Any, name: Any, field_name: str) -> Any:
@@ -501,12 +560,41 @@ def _operation_id(operation: Mapping[str, Any], kind: str) -> str:
 def _reference_id(reference: Any) -> str | None:
     if not isinstance(reference, Mapping):
         return None
+    if set(reference) == {"path"}:
+        return None
     if set(reference) != {"ref"}:
         raise ValueError("Symbolic references must contain only {'ref': 'id'}.")
     value = reference.get("ref")
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Symbolic reference id must be a non-empty string.")
     return value
+
+
+def _node_reference_spec(reference: Any, field_name: str) -> tuple[str, str]:
+    """Parse a node reference without conflating PATCH IDs and scene paths."""
+    if isinstance(reference, str):
+        if not reference:
+            raise ValueError("Action field %r must be a non-empty node path string." % field_name)
+        return "legacy_path", reference
+    if not isinstance(reference, Mapping):
+        raise ValueError(
+            "Action field %r must be a node path string, {'ref': 'id'}, or {'path': 'path'}."
+            % field_name
+        )
+    if set(reference) == {"ref"}:
+        value = reference.get("ref")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("PATCH node reference id must be a non-empty string.")
+        return "ref", value
+    if set(reference) == {"path"}:
+        value = reference.get("path")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Existing node path must be a non-empty string.")
+        return "path", value
+    raise ValueError(
+        "Node reference in field %r must contain exactly one of {'ref': 'id'} or {'path': 'path'}."
+        % field_name
+    )
 
 
 def _check_fields(operation: Mapping[str, Any], action: str, required: set[str], optional: set[str]) -> None:

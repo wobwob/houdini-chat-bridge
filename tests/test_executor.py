@@ -13,9 +13,10 @@ from houdini_chat_bridge.executor import execute_operations
 
 
 class FakeParameter:
-    def __init__(self, value):
+    def __init__(self, value, spare=False):
         self.value = value
         self.expression = None
+        self.spare = spare
 
     def set(self, value):
         if value == "fail":
@@ -24,6 +25,9 @@ class FakeParameter:
 
     def setExpression(self, expression, language=None):
         self.expression = expression
+
+    def isSpare(self):
+        return self.spare
 
 
 class FakeConnection:
@@ -56,6 +60,7 @@ class FakeNode:
         self.comment = ""
         self.boxes = []
         self.hda_definition = FakeHDADefinition()
+        self.parameter_group = FakeParmTemplateGroup()
 
     def isValid(self):
         return True
@@ -71,6 +76,16 @@ class FakeNode:
 
     def parm(self, name):
         return self.parameters.get(name)
+
+    def parmTemplateGroup(self):
+        return self.parameter_group
+
+    def setParmTemplateGroup(self, group, rename_conflicting_parms=False):
+        self.parameter_group = group
+        self.rename_conflicting_parms = rename_conflicting_parms
+        for template in _fake_leaf_templates(group.templates):
+            if template.name() not in self.parameters:
+                self.parameters[template.name()] = FakeParameter(0, spare=True)
 
     def createNode(self, node_type_name, name):
         node_name = name or node_type_name
@@ -192,17 +207,79 @@ class FakeNodeType:
 
 
 class FakeParmTemplateGroup:
-    def __init__(self):
-        self.templates = []
+    def __init__(self, templates=None):
+        self.templates = list(templates or [])
 
     def append(self, template):
         self.templates.append(template)
+
+    def find(self, name):
+        for template in self.templates:
+            if template.name() == name:
+                return template
+        return None
+
+    def replace(self, name, template):
+        for index, current in enumerate(self.templates):
+            if current.name() == name:
+                self.templates[index] = template
+                return
+        raise ValueError("Template %s does not exist." % name)
 
 
 class FakeParmTemplate:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+
+    def name(self):
+        return self.args[0]
+
+
+class FakeFolderParmTemplate(FakeParmTemplate):
+    def parmTemplates(self):
+        return self.kwargs.get("parm_templates", ())
+
+    def addParmTemplate(self, template):
+        self.kwargs["parm_templates"] = self.parmTemplates() + (template,)
+
+
+class FakeFloatParmTemplate(FakeParmTemplate):
+    def __init__(self, *args, **kwargs):
+        _require_tuple_default("FloatParmTemplate", kwargs)
+        super().__init__(*args, **kwargs)
+
+
+class FakeIntParmTemplate(FakeParmTemplate):
+    def __init__(self, *args, **kwargs):
+        _require_tuple_default("IntParmTemplate", kwargs)
+        super().__init__(*args, **kwargs)
+
+
+class FakeStringParmTemplate(FakeParmTemplate):
+    def __init__(self, *args, **kwargs):
+        _require_tuple_default("StringParmTemplate", kwargs)
+        super().__init__(*args, **kwargs)
+
+
+class FakeMenuParmTemplate(FakeParmTemplate):
+    def __init__(self, *args, **kwargs):
+        if not isinstance(kwargs.get("default_value"), int):
+            raise TypeError("MenuParmTemplate default_value must be an integer index.")
+        super().__init__(*args, **kwargs)
+
+
+def _require_tuple_default(template_type, kwargs):
+    if not isinstance(kwargs.get("default_value"), tuple):
+        raise TypeError("%s default_value must be a tuple." % template_type)
+
+
+def _fake_leaf_templates(templates):
+    for template in templates:
+        if isinstance(template, FakeFolderParmTemplate):
+            yield from _fake_leaf_templates(template.parmTemplates())
+        else:
+            yield template
 
 
 class FakeUndoGroup:
@@ -234,12 +311,12 @@ class FakeHou:
         self.undos = FakeUndos(recorder)
         self.exprLanguage = type("ExprLanguage", (), {"Hscript": "Hscript", "Python": "Python"})
         self.ParmTemplateGroup = FakeParmTemplateGroup
-        self.FolderParmTemplate = FakeParmTemplate
-        self.FloatParmTemplate = FakeParmTemplate
-        self.IntParmTemplate = FakeParmTemplate
+        self.FolderParmTemplate = FakeFolderParmTemplate
+        self.FloatParmTemplate = FakeFloatParmTemplate
+        self.IntParmTemplate = FakeIntParmTemplate
         self.ToggleParmTemplate = FakeParmTemplate
-        self.StringParmTemplate = FakeParmTemplate
-        self.MenuParmTemplate = FakeParmTemplate
+        self.StringParmTemplate = FakeStringParmTemplate
+        self.MenuParmTemplate = FakeMenuParmTemplate
 
     def node(self, path):
         return self.nodes.get(path)
@@ -305,6 +382,17 @@ class ExecutorTests(unittest.TestCase):
         ):
             return execute_operations(self.parent, operations, **kwargs)
 
+    def add_existing_node(self, name, *, parameters=None, node_type_name="null"):
+        node = FakeNode(
+            "%s/%s" % (self.parent.path(), name),
+            parent=self.parent,
+            parameters=parameters or {},
+            node_type_name=node_type_name,
+        )
+        self.parent.children.append(node)
+        self.hou.nodes[node.path()] = node
+        return node
+
     def test_executes_scoped_existing_node_batch_in_one_undo_group_and_returns_diff(self):
         result = self.execute(
             [{"action": "set_parameter", "node": "/obj/custom/POLE", "parameter": "height", "value": 5.0}],
@@ -329,6 +417,83 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(created.parm("height").value, 5.0)
         self.assertEqual(result["diff"]["created_nodes"][0]["name"], "A")
         self.assertEqual(len(result["operations_completed"]), 2)
+
+    def test_node_reference_path_resolves_relative_and_absolute_existing_nodes(self):
+        existing = self.add_existing_node("HOUSE_CONTROLS")
+        relative = self.execute([
+            {"action": "set_node_comment", "node": {"path": "./HOUSE_CONTROLS"}, "comment": "Relative"},
+        ])
+        absolute = self.execute([
+            {"action": "set_node_comment", "node": {"path": existing.path()}, "comment": "Absolute"},
+        ])
+
+        self.assertTrue(relative["success"])
+        self.assertTrue(absolute["success"])
+        self.assertEqual(existing.comment, "Absolute")
+
+    def test_node_reference_path_check_is_non_mutating_and_execute_modifies_existing_node(self):
+        existing = self.add_existing_node(
+            "HOUSE_CONTROLS", parameters={"height": FakeParameter(4.0)}
+        )
+        operation = {
+            "action": "set_parameter", "node": {"path": "HOUSE_CONTROLS"},
+            "parameter": "height", "value": 6.0,
+        }
+
+        checked = self.execute([operation], dry_run=True)
+        executed = self.execute([operation])
+
+        self.assertTrue(checked["success"])
+        self.assertTrue(executed["success"])
+        self.assertEqual(existing.parm("height").value, 6.0)
+
+    def test_node_reference_errors_distinguish_path_ref_and_malformed_objects(self):
+        missing_path = self.execute([
+            {"action": "set_node_comment", "node": {"path": "MISSING"}, "comment": "Nope"},
+        ], dry_run=True)
+        missing_ref = self.execute([
+            {"action": "set_node_comment", "node": {"ref": "missing"}, "comment": "Nope"},
+        ], dry_run=True)
+        malformed = self.execute([
+            {"action": "set_node_comment", "node": {}, "comment": "Nope"},
+        ], dry_run=True)
+        both = self.execute([
+            {"action": "set_node_comment", "node": {"ref": "a", "path": "A"}, "comment": "Nope"},
+        ], dry_run=True)
+
+        self.assertIn("Existing node does not exist: MISSING", missing_path["errors"][0]["message"])
+        self.assertIn("PATCH node reference does not exist: missing", missing_ref["errors"][0]["message"])
+        self.assertIn("exactly one", malformed["errors"][0]["message"])
+        self.assertIn("exactly one", both["errors"][0]["message"])
+        self.assertEqual(self.events, [])
+
+    def test_connect_nodes_supports_existing_and_same_batch_node_references(self):
+        roof_input = self.add_existing_node("ROOF_IN")
+        assembly = self.add_existing_node("HOUSE_ASSEMBLY")
+        result = self.execute([
+            {"action": "create_node", "id": "reverse", "node_type_name": "reverse", "name": "FIX_ROOF_NORMALS"},
+            {"action": "connect_nodes", "source": {"path": "ROOF_IN"}, "target": {"ref": "reverse"}},
+            {"action": "connect_nodes", "source": {"ref": "reverse"}, "target": {"path": "HOUSE_ASSEMBLY"}, "input_index": 2},
+        ])
+
+        reverse = self.parent.children[-1]
+        self.assertTrue(result["success"])
+        self.assertIs(reverse.inputConnections()[0].outputNode(), roof_input)
+        self.assertIs(assembly.inputConnections()[0].outputNode(), reverse)
+        self.assertEqual(assembly.inputConnections()[0].inputIndex(), 2)
+
+    def test_node_parameter_interface_accepts_existing_path_reference(self):
+        controls = self.add_existing_node("HOUSE_CONTROLS")
+        result = self.execute([
+            {"action": "install_node_parameter_interface", "node": {"path": "HOUSE_CONTROLS"}, "templates": [
+                {"type": "folder", "name": "dimensions", "label": "Dimensions", "children": [
+                    {"type": "float", "name": "house_width", "label": "House Width", "default": 5.0},
+                ]},
+            ]},
+        ])
+
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(controls.parm("house_width"))
 
     def test_create_then_connect_symbolic_references(self):
         result = self.execute([
@@ -552,6 +717,114 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(len(asset.hda_definition.parameter_group.templates), 1)
         folder = asset.hda_definition.parameter_group.templates[0]
         self.assertEqual(len(folder.kwargs["parm_templates"]), 5)
+
+    def test_node_parameter_interface_dry_run_is_non_mutating_and_id_reference_executes(self):
+        templates = [
+            {"type": "folder", "name": "dimensions", "label": "Dimensions", "children": [
+                {"type": "float", "name": "house_width", "label": "House Width", "default": 5.0, "min": 2.0, "max": 12.0, "min_strict": True},
+                {"type": "int", "name": "window_rows", "label": "Rows", "default": 3, "min": 1, "max": 8},
+                {"type": "toggle", "name": "chimney", "label": "Enable Chimney", "default": True},
+                {"type": "string", "name": "asset_label", "label": "Asset Label", "default": "Dutch House"},
+                {"type": "folder", "name": "roof", "label": "Roof", "children": [
+                    {"type": "menu", "name": "gable_style", "label": "Gable Style", "items": [
+                        {"value": "pitched", "label": "Pitched"},
+                        {"value": "stepped", "label": "Stepped"},
+                    ], "default": "pitched"},
+                ]},
+            ]},
+        ]
+        operations = [
+            {"action": "create_node", "id": "controls", "node_type_name": "null", "name": "HOUSE_CONTROLS"},
+            {"action": "install_node_parameter_interface", "node": "controls", "templates": templates},
+        ]
+
+        checked = self.execute(operations, dry_run=True)
+        executed = self.execute(operations)
+
+        controls = self.parent.children[-1]
+        self.assertTrue(checked["success"])
+        self.assertEqual(len(self.parent.children), 2)
+        self.assertEqual(self.events, [("group", "Houdini Chat Bridge batch"), ("enter", "Houdini Chat Bridge batch"), ("exit", "Houdini Chat Bridge batch")])
+        self.assertTrue(executed["success"])
+        dimensions = controls.parameter_group.find("dimensions")
+        self.assertIsNotNone(dimensions)
+        child_names = [child.name() for child in dimensions.parmTemplates()]
+        self.assertEqual(child_names, ["house_width", "window_rows", "chimney", "asset_label", "roof"])
+        children = {child.name(): child for child in dimensions.parmTemplates()}
+        self.assertEqual(children["house_width"].kwargs["default_value"], (5.0,))
+        self.assertEqual(children["window_rows"].kwargs["default_value"], (3,))
+        self.assertEqual(children["asset_label"].kwargs["default_value"], ("Dutch House",))
+        roof = dimensions.parmTemplates()[-1]
+        menu = roof.parmTemplates()[0]
+        self.assertEqual(menu.name(), "gable_style")
+        self.assertEqual(menu.kwargs["default_value"], 0)
+        self.assertEqual(controls.parm("house_width").isSpare(), True)
+        self.assertFalse(controls.rename_conflicting_parms)
+
+    def test_node_parameter_interface_upserts_and_preserves_existing_templates(self):
+        controls = self.parent.createNode("null", "HOUSE_CONTROLS")
+        self.hou.nodes[controls.path()] = controls
+        standard = FakeParmTemplate("tx", "Translate X")
+        unrelated = FakeParmTemplate("artist_note", "Artist Note")
+        controls.parameter_group = FakeParmTemplateGroup([standard, unrelated])
+        first = [{"type": "folder", "name": "dimensions", "label": "Dimensions", "children": [
+            {"type": "float", "name": "house_width", "label": "House Width", "default": 5.0},
+            {"type": "float", "name": "house_depth", "label": "House Depth", "default": 8.0},
+        ]}]
+        updated = [{"type": "folder", "name": "dimensions", "label": "Dimensions", "children": [
+            {"type": "float", "name": "house_width", "label": "House Width", "default": 8.0},
+            {"type": "int", "name": "window_rows", "label": "Rows", "default": 3},
+        ]}]
+
+        first_result = self.execute([
+            {"action": "install_node_parameter_interface", "node": controls.path(), "templates": first},
+        ])
+        updated_result = self.execute([
+            {"action": "install_node_parameter_interface", "node": controls.path(), "templates": updated},
+        ])
+
+        self.assertTrue(first_result["success"])
+        self.assertTrue(updated_result["success"])
+        self.assertEqual([template.name() for template in controls.parameter_group.templates], [
+            "tx", "artist_note", "dimensions",
+        ])
+        dimensions = controls.parameter_group.find("dimensions")
+        self.assertEqual([template.name() for template in dimensions.parmTemplates()], [
+            "house_width", "house_depth", "window_rows",
+        ])
+        self.assertEqual(dimensions.parmTemplates()[0].kwargs["default_value"], (8.0,))
+
+    def test_node_parameter_interface_check_rejects_builtin_parameter_name(self):
+        result = self.execute([
+            {"action": "install_node_parameter_interface", "node": self.pole.path(), "templates": [
+                {"type": "float", "name": "height", "label": "Height", "default": 5.0},
+            ]},
+        ], dry_run=True)
+
+        self.assertFalse(result["success"])
+        self.assertIn("built in and cannot be replaced", result["errors"][0]["message"])
+        self.assertEqual(self.events, [])
+
+    def test_node_parameter_interface_reports_hom_error_details(self):
+        controls = self.parent.createNode("null", "BROKEN_CONTROLS")
+        self.hou.nodes[controls.path()] = controls
+
+        def fail_to_install(group, rename_conflicting_parms=False):
+            raise TypeError("expected a sequence for default_value")
+
+        controls.setParmTemplateGroup = fail_to_install
+        result = self.execute([
+            {"action": "install_node_parameter_interface", "node": controls.path(), "templates": [
+                {"type": "float", "name": "house_width", "label": "House Width", "default": 5.0},
+            ]},
+        ])
+
+        self.assertFalse(result["success"])
+        error = result["errors"][0]
+        self.assertEqual(error["operation_index"], 0)
+        self.assertEqual(error["action"], "install_node_parameter_interface")
+        self.assertIn(controls.path(), error["message"])
+        self.assertIn("TypeError: expected a sequence for default_value", error["message"])
 
     def test_descendant_existing_path_is_in_scope_and_expression_language_aliases_work(self):
         subnet = self.parent.createNode("subnet", "ASSEMBLY")

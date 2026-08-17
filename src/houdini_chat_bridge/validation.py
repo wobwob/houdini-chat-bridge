@@ -123,6 +123,175 @@ def validate_hda_parameter_interface(templates: Any, mode: Any) -> list[dict[str
     return [_validate_hda_template(template, names) for template in templates]
 
 
+def validate_node_parameter_interface(templates: Any) -> list[dict[str, Any]]:
+    """Validate a spare-parameter interface for an ordinary Houdini node.
+
+    This schema deliberately differs from the HDA-definition schema: it is a
+    small scalar-control format suited to temporary controller nodes.
+    """
+    prefix = "install_node_parameter_interface"
+    if not isinstance(templates, list):
+        raise ValueError("%s: templates must be an array." % prefix)
+    names: set[str] = set()
+    return [_validate_node_template(template, names) for template in templates]
+
+
+def require_node_parameter_interface(node: Any) -> Any:
+    """Validate that an ordinary node can safely carry spare parameters."""
+    node = require_valid_node(node, "parameter-interface node")
+    require_method(
+        node,
+        "parmTemplateGroup",
+        "Node %s does not support parameter-template groups." % node_label(node),
+    )
+    require_method(
+        node,
+        "setParmTemplateGroup",
+        "Node %s cannot install parameter-template groups." % node_label(node),
+    )
+    return node
+
+
+def validate_node_parameter_interface_target(
+    node: Any, templates: list[dict[str, Any]]
+) -> Any:
+    """Ensure submitted spare names do not replace built-in parameters."""
+    node = require_node_parameter_interface(node)
+    for template in templates:
+        for name in _node_template_names(template):
+            try:
+                parameter = node.parm(name)
+                is_spare = getattr(parameter, "isSpare", None) if parameter is not None else None
+                if callable(is_spare) and is_spare() is False:
+                    raise RuntimeError(
+                        "Parameter %r on node %s is built in and cannot be replaced."
+                        % (name, node_label(node))
+                    )
+            except RuntimeError:
+                raise
+            except Exception as error:
+                raise RuntimeError(
+                    "Could not inspect parameter %r on node %s." % (name, node_label(node))
+                ) from error
+    return node
+
+
+def _validate_node_template(template: Any, names: set[str]) -> dict[str, Any]:
+    prefix = "install_node_parameter_interface"
+    if not isinstance(template, dict):
+        raise ValueError("%s: each template must be an object." % prefix)
+    kind = template.get("type")
+    if kind not in {"folder", "float", "int", "toggle", "string", "menu"}:
+        raise ValueError("%s: unsupported template type %r." % (prefix, kind))
+    name = _node_template_text(template.get("name"), "parameter name")
+    label = _node_template_text(template.get("label"), "parameter label")
+    if name in names:
+        raise ValueError('%s: duplicate parameter name "%s".' % (prefix, name))
+    names.add(name)
+
+    allowed = {"type", "name", "label"}
+    if kind == "folder":
+        allowed.add("children")
+    elif kind in {"float", "int"}:
+        allowed.update({"default", "min", "max", "min_strict", "max_strict"})
+    elif kind in {"toggle", "string"}:
+        allowed.add("default")
+    elif kind == "menu":
+        allowed.update({"items", "default"})
+    unknown = sorted(set(template) - allowed)
+    if unknown:
+        raise ValueError("%s: template %r has unsupported field(s): %s." % (
+            prefix, name, ", ".join(unknown),
+        ))
+
+    result = dict(template)
+    if kind == "folder":
+        children = result.get("children")
+        if not isinstance(children, list):
+            raise ValueError("%s: folder %r children must be an array." % (prefix, name))
+        result["children"] = [_validate_node_template(child, names) for child in children]
+        return result
+    if kind == "float":
+        _validate_node_numeric_template(result, name, integer=False)
+    elif kind == "int":
+        _validate_node_numeric_template(result, name, integer=True)
+    elif kind == "toggle" and "default" in result and not isinstance(result["default"], bool):
+        raise ValueError("%s: toggle %r default must be a boolean." % (prefix, name))
+    elif kind == "string" and "default" in result and not isinstance(result["default"], str):
+        raise ValueError("%s: string %r default must be a string." % (prefix, name))
+    elif kind == "menu":
+        _validate_node_menu_template(result, name)
+    return result
+
+
+def _node_template_names(template: dict[str, Any]) -> list[str]:
+    names = [template["name"]]
+    if template["type"] == "folder":
+        for child in template["children"]:
+            names.extend(_node_template_names(child))
+    return names
+
+
+def _validate_node_numeric_template(template: dict[str, Any], name: str, *, integer: bool) -> None:
+    prefix = "install_node_parameter_interface"
+    type_name = "integer" if integer else "numeric"
+    for field in ("default", "min", "max"):
+        if field not in template:
+            continue
+        value = template[field]
+        valid = (
+            isinstance(value, int) and not isinstance(value, bool)
+            if integer else isinstance(value, (int, float)) and not isinstance(value, bool)
+        )
+        if not valid:
+            raise ValueError("%s: %s %r %s must be %s." % (
+                prefix, template["type"], name, field, type_name,
+            ))
+    for field in ("min_strict", "max_strict"):
+        if field in template and not isinstance(template[field], bool):
+            raise ValueError("%s: %s %r %s must be a boolean." % (
+                prefix, template["type"], name, field,
+            ))
+    if "min" in template and "max" in template and template["min"] > template["max"]:
+        raise ValueError("%s: %s %r min cannot be greater than max." % (
+            prefix, template["type"], name,
+        ))
+
+
+def _validate_node_menu_template(template: dict[str, Any], name: str) -> None:
+    prefix = "install_node_parameter_interface"
+    items = template.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("%s: menu %r items must be a non-empty array." % (prefix, name))
+    values: set[str] = set()
+    validated_items: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("%s: menu %r items must be objects." % (prefix, name))
+        if set(item) != {"value", "label"}:
+            raise ValueError("%s: menu %r items require only value and label." % (prefix, name))
+        value = _node_template_text(item.get("value"), "menu value")
+        label = _node_template_text(item.get("label"), "menu item label")
+        if value in values:
+            raise ValueError('%s: menu %r has duplicate value "%s".' % (prefix, name, value))
+        values.add(value)
+        validated_items.append({"value": value, "label": label})
+    template["items"] = validated_items
+    if "default" in template:
+        default = template["default"]
+        if not isinstance(default, str) or default not in values:
+            raise ValueError('%s: menu "%s" default "%s" is not one of its items.' % (
+                prefix, name, default,
+            ))
+
+
+def _node_template_text(value: Any, field_name: str) -> str:
+    prefix = "install_node_parameter_interface"
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s: %s must be a non-empty string." % (prefix, field_name))
+    return value
+
+
 def _validate_hda_template(template: Any, names: set[str]) -> dict[str, Any]:
     if not isinstance(template, dict):
         raise ValueError("Each HDA parameter template must be a mapping.")
