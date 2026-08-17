@@ -61,9 +61,10 @@ class FakeNode:
         self.boxes = []
         self.hda_definition = FakeHDADefinition()
         self.parameter_group = FakeParmTemplateGroup()
+        self.valid = True
 
     def isValid(self):
-        return True
+        return self.valid
 
     def path(self):
         return self.path_value
@@ -97,6 +98,13 @@ class FakeNode:
         )
         self.children.append(node)
         return node
+
+    def destroy(self):
+        if self.children:
+            raise RuntimeError("cannot destroy a node with children")
+        if self.parent_value is not None:
+            self.parent_value.children.remove(self)
+        self.valid = False
 
     def createNetworkBox(self, name):
         box = FakeNetworkBox(self, name or "network_box")
@@ -494,6 +502,70 @@ class ExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertIsNotNone(controls.parm("house_width"))
+
+    def test_delete_node_removes_existing_path_target_inside_undo_and_diff(self):
+        unused = self.add_existing_node("UNUSED_NODE")
+        result = self.execute([
+            {"action": "delete_node", "node": {"path": "UNUSED_NODE"}},
+        ])
+
+        self.assertTrue(result["success"])
+        self.assertFalse(unused.isValid())
+        self.assertNotIn(unused, self.parent.children)
+        self.assertEqual(result["diff"]["deleted_nodes"][0]["path"], unused.path())
+        self.assertEqual(self.events, [
+            ("group", "Houdini Chat Bridge batch"),
+            ("enter", "Houdini Chat Bridge batch"),
+            ("exit", "Houdini Chat Bridge batch"),
+        ])
+
+    def test_delete_node_dry_run_and_invalid_targets_do_not_mutate(self):
+        unused = self.add_existing_node("UNUSED_NODE")
+        checked = self.execute([
+            {"action": "delete_node", "node": {"path": "UNUSED_NODE"}},
+        ], dry_run=True)
+        missing = self.execute([
+            {"action": "delete_node", "node": {"path": "MISSING"}},
+        ], dry_run=True)
+        malformed = self.execute([
+            {"action": "delete_node", "node": {"path": "UNUSED_NODE"}, "force": True},
+        ], dry_run=True)
+
+        self.assertTrue(checked["success"])
+        self.assertTrue(unused.isValid())
+        self.assertIn("Existing node does not exist: MISSING", missing["errors"][0]["message"])
+        self.assertIn("unsupported field", malformed["errors"][0]["message"])
+        self.assertEqual(self.events, [])
+
+    def test_delete_node_rejects_execution_root_and_out_of_scope_nodes(self):
+        other_parent = FakeNode("/obj/other")
+        outside = FakeNode("/obj/other/UNUSED", parent=other_parent)
+        self.hou.nodes[outside.path()] = outside
+        root = self.execute([
+            {"action": "delete_node", "node": {"path": self.parent.path()}},
+        ], dry_run=True)
+        out_of_scope = self.execute([
+            {"action": "delete_node", "node": {"path": outside.path()}},
+        ], dry_run=True)
+
+        self.assertIn("Cannot delete the execution root", root["errors"][0]["message"])
+        self.assertIn("outside execution scope", out_of_scope["errors"][0]["message"])
+        self.assertTrue(outside.isValid())
+
+    def test_delete_node_invalidates_same_batch_symbolic_reference(self):
+        result = self.execute([
+            {"action": "create_node", "id": "temp", "node_type_name": "null", "name": "TEMP"},
+            {"action": "delete_node", "node": {"ref": "temp"}},
+            {"action": "set_node_comment", "node": {"ref": "temp"}, "comment": "Should fail"},
+        ])
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["operations_completed"], [
+            {"index": 0, "action": "create_node"},
+            {"index": 1, "action": "delete_node"},
+        ])
+        self.assertIn("unavailable as a node", result["errors"][0]["message"])
+        self.assertFalse(any(node.name() == "TEMP" for node in self.parent.children))
 
     def test_create_then_connect_symbolic_references(self):
         result = self.execute([

@@ -14,6 +14,7 @@ from .validation import (
     input_connection,
     node_label,
     require_method,
+    require_deletable_node,
     require_network_parent,
     require_parameter,
     require_subnet_node,
@@ -58,6 +59,16 @@ def create_node(
         except Exception as error:
             raise RuntimeError("Could not position new node %s." % node_label(node)) from error
     return node
+
+
+def delete_node(node: Any) -> None:
+    """Destroy one validated leaf node through Houdini's normal undo system."""
+    node = require_deletable_node(node)
+    destroy = require_method(node, "destroy", "Node %s cannot be deleted." % node_label(node))
+    try:
+        destroy()
+    except Exception as error:
+        raise RuntimeError("Could not delete node %s." % node_label(node)) from error
 
 
 def set_parameter(node: Any, parameter_name: str, value: Any) -> Any:

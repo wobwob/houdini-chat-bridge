@@ -60,7 +60,7 @@ occurs when its operation executes inside the batch's one undo group.
 
 Supported actions are:
 
-- `create_node`, `set_parameter`, `set_expression`, `connect_nodes`,
+- `create_node`, `delete_node`, `set_parameter`, `set_expression`, `connect_nodes`,
   `disconnect_input`, `set_display_flag`, `set_render_flag`, and
   `set_node_comment`.
 - `create_network_box`, `add_nodes_to_network_box`, and `create_sticky_note`.
@@ -200,6 +200,17 @@ controls:
 references. `add_nodes_to_network_box` accepts a network-box reference and a
 list of node references. Network boxes are black by default where Houdini
 supports colors; membership is idempotent and `fit` defaults to `true`.
+
+`delete_node` is an explicit, scope-limited destructive action for an existing
+leaf node. It cannot delete the current execution root or a node outside that
+root's network scope.
+
+```json
+{
+  "action": "delete_node",
+  "node": {"path": "OLD_IMPLEMENTATION"}
+}
+```
 
 Snapshots now recursively include descendants for executor before/after diffs,
 and retain node comments as deliberate scene state. `diff.py` remains pure

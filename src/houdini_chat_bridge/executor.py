@@ -18,6 +18,7 @@ from .validation import (
     input_connection,
     node_label,
     require_network_parent,
+    require_deletable_node,
     require_parameter,
     require_subnet_node,
     require_valid_node,
@@ -37,7 +38,7 @@ from .validation import (
 
 DEFAULT_LABEL = "Houdini Chat Bridge batch"
 _SUPPORTED_ACTIONS = {
-    "create_node", "set_parameter", "set_expression", "connect_nodes",
+    "create_node", "delete_node", "set_parameter", "set_expression", "connect_nodes",
     "disconnect_input", "set_display_flag", "set_render_flag", "set_node_comment",
     "create_network_box", "add_nodes_to_network_box", "create_sticky_note",
     "create_hda", "install_hda_parameter_interface", "install_node_parameter_interface",
@@ -186,6 +187,12 @@ def _preflight_operation(hou: Any, parent: Any, operation: Mapping[str, Any], de
         validate_position(operation.get("position"))
         _preflight_parent(hou, parent, operation.get("parent"), declared, available)
         return _created_symbol(operation, _NODE_SYMBOL, seen)
+    if action == "delete_node":
+        _check_fields(operation, action, {"node"}, set())
+        node = _preflight_node_target(hou, parent, operation["node"], "node", declared, available)
+        if node is not None:
+            _validate_delete_target(node, parent)
+        return None
     if action == "set_parameter":
         _check_fields(operation, action, {"node", "parameter", "value"}, set())
         node = _preflight_node_target(hou, parent, operation["node"], "node", declared, available)
@@ -333,6 +340,12 @@ def _dispatch(plan: Mapping[str, Any], hou: Any, root: Any, symbols: dict[str, d
         node = actions.create_node(_runtime_parent(hou, root, symbols, operation.get("parent")), operation["node_type_name"], name=operation.get("name"), position=operation.get("position"))
         _store_symbol(symbols, operation, _NODE_SYMBOL, node)
         return node
+    if action == "delete_node":
+        node = _runtime_node(hou, root, symbols, operation["node"], "node")
+        _validate_delete_target(node, root)
+        actions.delete_node(node)
+        _invalidate_node_symbol(symbols, operation["node"])
+        return None
     if action == "set_parameter":
         return actions.set_parameter(_runtime_node(hou, root, symbols, operation["node"], "node"), operation["parameter"], operation["value"])
     if action == "set_expression":
@@ -435,6 +448,18 @@ def _runtime_symbol(symbols: Mapping[str, Mapping[str, Any]], reference_id: str,
     if value is None:
         raise RuntimeError("Symbolic network box reference %r is invalid." % reference_id)
     return value
+
+
+def _validate_delete_target(node: Any, root: Any) -> Any:
+    if node is root or node_label(node) == node_label(root):
+        raise RuntimeError("Cannot delete the execution root node %s." % node_label(root))
+    return require_deletable_node(node)
+
+
+def _invalidate_node_symbol(symbols: dict[str, dict[str, Any]], reference: Any) -> None:
+    reference_id = _reference_id(reference)
+    if reference_id is not None:
+        symbols.pop(reference_id, None)
 
 
 def _validate_connection_fields(operation: Mapping[str, Any], source: Any | None, target: Any | None) -> None:

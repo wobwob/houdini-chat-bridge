@@ -63,6 +63,19 @@ def require_parameter(node: Any, parameter_name: str) -> Any:
     return parameter
 
 
+def require_deletable_node(node: Any) -> Any:
+    """Validate a leaf node can be safely removed with HOM."""
+    node = require_valid_node(node, "node to delete")
+    children = _node_children(node)
+    if children:
+        raise RuntimeError(
+            "Node %s has children and cannot be deleted by this action."
+            % node_label(node)
+        )
+    require_method(node, "destroy", "Node %s cannot be deleted." % node_label(node))
+    return node
+
+
 def require_method(target: Any, method_name: str, message: str) -> Any:
     """Return a callable method or raise ``RuntimeError`` with ``message``."""
     try:
@@ -72,6 +85,21 @@ def require_method(target: Any, method_name: str, message: str) -> Any:
     if not callable(method):
         raise RuntimeError(message)
     return method
+
+
+def _node_children(node: Any) -> list[Any]:
+    """Return children from HOM, with list attributes tolerated by test fakes."""
+    try:
+        value = getattr(node, "children")
+        children = value() if callable(value) else value
+    except AttributeError:
+        return []
+    except Exception as error:
+        raise RuntimeError("Could not inspect children of node %s." % node_label(node)) from error
+    try:
+        return list(children)
+    except TypeError as error:
+        raise RuntimeError("Could not inspect children of node %s." % node_label(node)) from error
 
 
 def validate_node_type_name(node_type_name: str) -> str:
