@@ -133,6 +133,31 @@ def inspect_current_context() -> dict[str, Any]:
     }
 
 
+def inspect_current_network() -> dict[str, Any]:
+    """Inspect every immediate child in the active Network Editor's network.
+
+    This describes the network currently visible in Houdini rather than
+    recursively walking into nested subnetworks.  It deliberately reuses the
+    same read-only node inspection as the other context exports.
+    """
+    hou = _get_hou()
+    if hou is None:
+        return _hou_unavailable("current_network")
+
+    editor = _find_network_editor(hou)
+    network = _call(editor, "pwd") if editor is not None else _call(hou, "pwd")
+    display_node = _call(network, "displayNode")
+    render_node = _call(network, "renderNode")
+    children = sorted(_sequence(_call(network, "children")), key=_node_sort_key)
+    return {
+        "network_editor": _editor_reference(editor),
+        "current_network": _node_reference(network),
+        "display_node": inspect_node(display_node) if _is_valid_node(display_node) else None,
+        "render_node": inspect_node(render_node) if _is_valid_node(render_node) else None,
+        "nodes": [inspect_node(node) for node in children],
+    }
+
+
 def _inspect_parameters(node: Any) -> list[dict[str, Any]]:
     parameters: list[dict[str, Any]] = []
     for parm in _sequence(_call(node, "parms")):

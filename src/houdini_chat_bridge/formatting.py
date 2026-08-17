@@ -52,6 +52,63 @@ def format_context_for_chatgpt(context: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_execution_summary(result: Mapping[str, Any]) -> str:
+    """Format a concise, user-facing execution success summary.
+
+    The complete structured executor result remains available separately for
+    debugging; this deliberately reports only the high-value scene changes.
+    """
+    diff = result.get("diff")
+    diff_data = diff if isinstance(diff, Mapping) else {}
+    completed = result.get("operations_completed")
+    completed_actions = [
+        item.get("action") for item in completed
+        if isinstance(item, Mapping) and isinstance(item.get("action"), str)
+    ] if isinstance(completed, list) else []
+    lines = ["SUCCESS"]
+    created_nodes = _item_count(diff_data.get("created_nodes"))
+    network_boxes = completed_actions.count("create_network_box")
+    if created_nodes or network_boxes:
+        lines.extend(["", "Created:"])
+        if created_nodes:
+            lines.append("  %d node%s" % (created_nodes, _plural_suffix(created_nodes)))
+        if network_boxes:
+            lines.append("  %d network box%s" % (network_boxes, _plural_suffix(network_boxes)))
+    parameter_changes = _item_count(diff_data.get("parameter_changes"))
+    if parameter_changes:
+        lines.extend(["", "Modified:", "  %d parameter%s" % (
+            parameter_changes, _plural_suffix(parameter_changes),
+        )])
+    hda_labels = _completed_hda_labels(result, completed_actions)
+    if hda_labels:
+        lines.extend(["", "HDA:"])
+        lines.extend("  %s" % label for label in hda_labels)
+    if len(lines) == 1:
+        lines.extend(["", "Patch executed successfully."])
+    return "\n".join(lines)
+
+
+def _completed_hda_labels(result: Mapping[str, Any], completed_actions: list[str]) -> list[str]:
+    if "create_hda" not in completed_actions:
+        return []
+    requested = result.get("operations_requested")
+    if not isinstance(requested, list):
+        return []
+    return [
+        str(operation.get("label") or operation.get("type_name"))
+        for operation in requested
+        if isinstance(operation, Mapping) and operation.get("action") == "create_hda"
+    ]
+
+
+def _item_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _plural_suffix(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
 def _format_node(node: Mapping[str, Any]) -> list[str]:
     if node.get("valid") is False:
         return ["- Invalid node: %s" % (node.get("path") or node.get("error") or "unknown")]

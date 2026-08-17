@@ -10,7 +10,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from houdini_chat_bridge.context import inspect_current_context, inspect_node, inspect_upstream_network
+from houdini_chat_bridge.context import (
+    inspect_current_context,
+    inspect_current_network,
+    inspect_node,
+    inspect_upstream_network,
+)
 
 
 class FakeCategory:
@@ -144,12 +149,16 @@ class FakeNetwork(FakeNode):
         super().__init__(path)
         self.display_node = display_node
         self.render_node = render_node
+        self.child_nodes = []
 
     def displayNode(self):
         return self.display_node
 
     def renderNode(self):
         return self.render_node
+
+    def children(self):
+        return self.child_nodes
 
 
 class FakeEditor:
@@ -245,6 +254,21 @@ class ContextInspectionTests(unittest.TestCase):
         self.assertEqual(
             [node["path"] for node in result["selected_nodes"]],
             ["/obj/custom/display", "/obj/custom/render"],
+        )
+
+    def test_current_network_inspects_immediate_children_in_stable_order(self):
+        display = FakeNode("/obj/custom/display")
+        render = FakeNode("/obj/custom/render")
+        network = FakeNetwork("/obj/custom", display, render)
+        network.child_nodes = [FakeNode("/obj/custom/z_last"), FakeNode("/obj/custom/a_first")]
+
+        with patch.dict(sys.modules, {"hou": FakeHou(network, [])}):
+            result = inspect_current_network()
+
+        self.assertEqual(result["current_network"]["path"], "/obj/custom")
+        self.assertEqual(
+            [node["path"] for node in result["nodes"]],
+            ["/obj/custom/a_first", "/obj/custom/z_last"],
         )
 
 
