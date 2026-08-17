@@ -167,6 +167,27 @@ class SnapshotDiffTests(unittest.TestCase):
         }])
         self.assertIn("Comments:\n- BODY: 'Old note' -> 'New note'", format_diff(result))
 
+    def test_detects_positions_and_network_box_membership(self):
+        before, after = fixtures()
+        before["nodes"][0]["position"] = [1.0, 2.0]
+        after["nodes"][0]["position"] = [-9.0, 14.0]
+        before["network_boxes"] = [{"name": "FACADE", "node_paths": ["/obj/build/body", "/obj/build/pole"]}]
+        after["network_boxes"] = [{"name": "FACADE", "node_paths": ["/obj/build/pole"]}]
+
+        result = compare_snapshots(before, after)
+
+        self.assertEqual(result["position_changes"], [{
+            "node": "/obj/build/body", "before": [1.0, 2.0], "after": [-9.0, 14.0],
+            "node_name": "BODY",
+        }])
+        self.assertEqual(result["network_box_membership_changes"], [{
+            "box": "FACADE", "before": ["/obj/build/body", "/obj/build/pole"],
+            "after": ["/obj/build/pole"],
+        }])
+        formatted = format_diff(result)
+        self.assertIn("Positions:\n- BODY: [1.0, 2.0] -> [-9.0, 14.0]", formatted)
+        self.assertIn("FACADE members", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()

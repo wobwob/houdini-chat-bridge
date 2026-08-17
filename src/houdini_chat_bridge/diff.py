@@ -22,6 +22,7 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
     connection_changes: list[dict[str, Any]] = []
     flag_changes: list[dict[str, Any]] = []
     comment_changes: list[dict[str, Any]] = []
+    position_changes: list[dict[str, Any]] = []
     modified: dict[str, dict[str, Any]] = {}
 
     for path in sorted(before_paths & after_paths):
@@ -32,13 +33,16 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
         connections = _connection_changes(path, before_node, after_node)
         flags = _flag_changes(path, before_node, after_node)
         comments = _comment_changes(path, before_node, after_node)
+        positions = _position_changes(path, before_node, after_node)
         _add_display_names(parameters, connections, flags + comments, before_nodes, after_nodes)
+        _add_display_names(positions, [], [], before_nodes, after_nodes)
 
         parameter_changes.extend(parameters)
         connection_changes.extend(connections)
         flag_changes.extend(flags)
         comment_changes.extend(comments)
-        if node_changes or parameters or connections or flags or comments:
+        position_changes.extend(positions)
+        if node_changes or parameters or connections or flags or comments or positions:
             modified[path] = {
                 "node": path,
                 "node_name": after_node.get("name") or before_node.get("name"),
@@ -47,7 +51,22 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
                 "connection_changes": connections,
                 "flag_changes": flags,
                 "comment_changes": comments,
+                "position_changes": positions,
             }
+
+    before_boxes = _network_box_index(before, "before")
+    after_boxes = _network_box_index(after, "after")
+    created_network_boxes = [after_boxes[name] for name in sorted(set(after_boxes) - set(before_boxes))]
+    deleted_network_boxes = [before_boxes[name] for name in sorted(set(before_boxes) - set(after_boxes))]
+    network_box_membership_changes = [
+        {
+            "box": name,
+            "before": before_boxes[name].get("node_paths", []),
+            "after": after_boxes[name].get("node_paths", []),
+        }
+        for name in sorted(set(before_boxes) & set(after_boxes))
+        if before_boxes[name].get("node_paths", []) != after_boxes[name].get("node_paths", [])
+    ]
 
     return {
         "created_nodes": created_nodes,
@@ -57,6 +76,10 @@ def compare_snapshots(before: Mapping[str, Any], after: Mapping[str, Any]) -> di
         "connection_changes": connection_changes,
         "flag_changes": flag_changes,
         "comment_changes": comment_changes,
+        "position_changes": position_changes,
+        "created_network_boxes": created_network_boxes,
+        "deleted_network_boxes": deleted_network_boxes,
+        "network_box_membership_changes": network_box_membership_changes,
     }
 
 
@@ -75,6 +98,10 @@ def format_diff(diff: Mapping[str, Any]) -> str:
     _append_flag_changes(lines, diff.get("flag_changes"))
     lines.extend(["", "Comments:"])
     _append_comment_changes(lines, diff.get("comment_changes"))
+    lines.extend(["", "Positions:"])
+    _append_position_changes(lines, diff.get("position_changes"))
+    lines.extend(["", "Network Boxes:"])
+    _append_network_box_changes(lines, diff.get("created_network_boxes"), diff.get("deleted_network_boxes"), diff.get("network_box_membership_changes"))
     lines.extend(["", "Deleted:"])
     _append_node_list(lines, diff.get("deleted_nodes"))
     return "\n".join(lines)
@@ -96,6 +123,24 @@ def _node_index(snapshot: Mapping[str, Any], label: str) -> dict[str, Mapping[st
         if path in index:
             raise ValueError("%s snapshot contains duplicate node path %r." % (label, path))
         index[path] = node
+    return index
+
+
+def _network_box_index(snapshot: Mapping[str, Any], label: str) -> dict[str, Mapping[str, Any]]:
+    boxes = snapshot.get("network_boxes", [])
+    if not isinstance(boxes, list):
+        raise ValueError("%s snapshot contains an invalid 'network_boxes' value." % label)
+    index: dict[str, Mapping[str, Any]] = {}
+    for box in boxes:
+        if not isinstance(box, Mapping) or not isinstance(box.get("name"), str) or not box["name"]:
+            raise ValueError("%s snapshot contains a network box without a name." % label)
+        name = box["name"]
+        if name in index:
+            raise ValueError("%s snapshot contains duplicate network box name %r." % (label, name))
+        node_paths = box.get("node_paths", [])
+        if not isinstance(node_paths, list) or any(not isinstance(path, str) for path in node_paths):
+            raise ValueError("Network box %r contains invalid node paths." % name)
+        index[name] = box
     return index
 
 
@@ -164,6 +209,16 @@ def _comment_changes(
     previous = before.get("comment")
     current = after.get("comment")
     if previous == current:
+        return []
+    return [{"node": path, "before": previous, "after": current}]
+
+
+def _position_changes(
+    path: str, before: Mapping[str, Any], after: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    previous = before.get("position")
+    current = after.get("position")
+    if previous is None or current is None or previous == current:
         return []
     return [{"node": path, "before": previous, "after": current}]
 
@@ -292,6 +347,34 @@ def _append_comment_changes(lines: list[str], changes: Any) -> None:
             lines.append("- %s: %r -> %r" % (
                 _node_label(change), change.get("before"), change.get("after"),
             ))
+
+
+def _append_position_changes(lines: list[str], changes: Any) -> None:
+    valid_changes = changes if isinstance(changes, list) else []
+    if not valid_changes:
+        lines.append("- none")
+        return
+    for change in valid_changes:
+        if isinstance(change, Mapping):
+            lines.append("- %s: %s -> %s" % (
+                _node_label(change), change.get("before"), change.get("after"),
+            ))
+
+
+def _append_network_box_changes(lines: list[str], created: Any, deleted: Any, memberships: Any) -> None:
+    entries: list[str] = []
+    for box in created if isinstance(created, list) else []:
+        if isinstance(box, Mapping):
+            entries.append("- created %s" % box.get("name"))
+    for box in deleted if isinstance(deleted, list) else []:
+        if isinstance(box, Mapping):
+            entries.append("- deleted %s" % box.get("name"))
+    for change in memberships if isinstance(memberships, list) else []:
+        if isinstance(change, Mapping):
+            entries.append("- %s members: %s -> %s" % (
+                change.get("box"), change.get("before"), change.get("after"),
+            ))
+    lines.extend(entries or ["- none"])
 
 
 def _parameter_value(value: Any) -> str:

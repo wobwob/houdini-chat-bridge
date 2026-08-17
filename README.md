@@ -64,6 +64,8 @@ Supported actions are:
   `disconnect_input`, `set_display_flag`, `set_render_flag`, and
   `set_node_comment`.
 - `create_network_box`, `add_nodes_to_network_box`, and `create_sticky_note`.
+- `set_node_position`, `delete_network_box`, and
+  `remove_nodes_from_network_box` for explicit edits to existing network items.
 - `create_hda`, `install_hda_parameter_interface`, and
   `install_node_parameter_interface`.
 
@@ -196,10 +198,33 @@ controls:
 ```
 
 `set_parameter`, `set_expression`, `connect_nodes`, `disconnect_input`,
-`set_display_flag`, `set_render_flag`, and `set_node_comment` all accept node
-references. `add_nodes_to_network_box` accepts a network-box reference and a
-list of node references. Network boxes are black by default where Houdini
-supports colors; membership is idempotent and `fit` defaults to `true`.
+`set_display_flag`, `set_render_flag`, `set_node_comment`, and
+`set_node_position` all accept node references. `set_node_position` takes a
+two-number Houdini network coordinate in `position`, for example:
+
+```json
+{
+  "action": "set_node_position",
+  "node": {"path": "WINDOW_FRAME_TOP"},
+  "position": [-9.0, 14.0]
+}
+```
+
+`add_nodes_to_network_box` and `remove_nodes_from_network_box` accept a
+network-box reference and a list of node references. Existing boxes use
+`{"name": "FACADE"}`; boxes created earlier in the same PATCH use
+`{"ref": "box_id"}`. Network boxes are black by default where Houdini
+supports colors; membership changes are idempotent and `fit` defaults to
+`true`.
+
+`delete_network_box` deletes only the named box, never its contained nodes:
+
+```json
+{
+  "action": "delete_network_box",
+  "box": {"name": "FACADE"}
+}
+```
 
 `delete_node` is an explicit, scope-limited destructive action for an existing
 leaf node. It cannot delete the current execution root or a node outside that
@@ -213,9 +238,10 @@ root's network scope.
 ```
 
 Snapshots now recursively include descendants for executor before/after diffs,
-and retain node comments as deliberate scene state. `diff.py` remains pure
-Python and reports comment changes alongside parameter, connection, and flag
-changes.
+and retain positions, node comments, and current-network box membership as
+deliberate scene state. `diff.py` remains pure Python and reports position and
+network-box membership changes alongside parameter, connection, flag, and
+comment changes.
 
 ## Intended architecture
 

@@ -169,6 +169,12 @@ class FakeNetworkBox:
     def addItem(self, item):
         self.contents.append(item)
 
+    def removeItem(self, item):
+        self.contents.remove(item)
+
+    def destroy(self):
+        self.parent_value.boxes.remove(self)
+
     def fitAroundContents(self):
         self.fit_count += 1
 
@@ -335,6 +341,9 @@ class FakeHou:
     def Color(self, value):
         return tuple(value)
 
+    def Vector2(self, x, y):
+        return (float(x), float(y))
+
 
 def snapshot_for(parent, recursive=False):
     nodes = []
@@ -361,6 +370,7 @@ def snapshot_for(parent, recursive=False):
                 "name": node.name(),
                 "type_name": node.node_type_name,
                 "type_category": "Sop",
+                "position": list(node.position) if node.position is not None else None,
                 "display_flag": node.display,
                 "render_flag": node.render,
                 "comment": node.comment,
@@ -368,7 +378,14 @@ def snapshot_for(parent, recursive=False):
                 "parameters": parameters,
             }
         )
-    return {"schema_version": 1, "nodes": nodes}
+    boxes = [
+        {
+            "name": box.name(),
+            "node_paths": sorted(item.path() for item in box.items() if hasattr(item, "path")),
+        }
+        for box in parent.networkBoxes()
+    ]
+    return {"schema_version": 2, "nodes": nodes, "network_boxes": boxes}
 
 
 class ExecutorTests(unittest.TestCase):
@@ -681,6 +698,96 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(result["diff"]["comment_changes"], [{
             "node": "/obj/custom/POLE", "before": "", "after": "Primary support", "node_name": "POLE",
         }])
+
+    def test_set_node_position_uses_existing_path_and_reports_before_after(self):
+        self.pole.position = (1.0, 2.0)
+        operation = {
+            "action": "set_node_position", "node": {"path": "POLE"},
+            "position": [-9.0, 14.0],
+        }
+
+        checked = self.execute([operation], dry_run=True)
+        self.assertEqual(self.pole.position, (1.0, 2.0))
+        executed = self.execute([operation])
+
+        self.assertTrue(checked["success"])
+        self.assertEqual(self.pole.position, (-9.0, 14.0))
+        self.assertTrue(executed["success"])
+        self.assertEqual(executed["diff"]["position_changes"], [{
+            "node": "/obj/custom/POLE", "before": [1.0, 2.0], "after": [-9.0, 14.0],
+            "node_name": "POLE",
+        }])
+
+    def test_set_node_position_rejects_invalid_reference_and_position_without_mutation(self):
+        self.pole.position = (1.0, 2.0)
+        missing = self.execute([
+            {"action": "set_node_position", "node": {"path": "MISSING"}, "position": [1, 2]},
+        ], dry_run=True)
+        malformed = self.execute([
+            {"action": "set_node_position", "node": {"path": "POLE"}, "position": [1]},
+        ], dry_run=True)
+
+        self.assertIn("Existing node does not exist: MISSING", missing["errors"][0]["message"])
+        self.assertIn("position must", malformed["errors"][0]["message"])
+        self.assertEqual(self.pole.position, (1.0, 2.0))
+        self.assertEqual(self.events, [])
+
+    def test_delete_network_box_by_name_preserves_nodes_and_reports_deleted_box(self):
+        box = self.parent.createNetworkBox("FACADE")
+        box.addItem(self.pole)
+        operation = {"action": "delete_network_box", "box": {"name": "FACADE"}}
+
+        checked = self.execute([operation], dry_run=True)
+        self.assertTrue(checked["success"])
+        self.assertIn(box, self.parent.boxes)
+        executed = self.execute([operation])
+
+        self.assertTrue(executed["success"])
+        self.assertNotIn(box, self.parent.boxes)
+        self.assertIn(self.pole, self.parent.children)
+        self.assertEqual(executed["diff"]["deleted_network_boxes"], [{
+            "name": "FACADE", "node_paths": [self.pole.path()],
+        }])
+
+    def test_remove_nodes_from_named_network_box_reports_membership_and_optional_fit(self):
+        second = self.add_existing_node("WINDOWS_OUT")
+        box = self.parent.createNetworkBox("FACADE")
+        box.addItem(self.pole)
+        box.addItem(second)
+        result = self.execute([
+            {
+                "action": "remove_nodes_from_network_box", "box": {"name": "FACADE"},
+                "nodes": [{"path": "POLE"}, {"path": "WINDOWS_OUT"}], "fit": True,
+            },
+        ])
+
+        self.assertTrue(result["success"])
+        self.assertEqual(box.items(), [])
+        self.assertEqual(box.fit_count, 1)
+        self.assertIn(self.pole, self.parent.children)
+        self.assertIn(second, self.parent.children)
+        self.assertEqual(result["diff"]["network_box_membership_changes"], [{
+            "box": "FACADE",
+            "before": [self.pole.path(), second.path()],
+            "after": [],
+        }])
+
+    def test_existing_network_box_errors_are_preflighted_without_mutation(self):
+        self.parent.createNetworkBox("DUPLICATE")
+        self.parent.createNetworkBox("DUPLICATE")
+        missing = self.execute([
+            {"action": "delete_network_box", "box": {"name": "MISSING"}},
+        ], dry_run=True)
+        ambiguous = self.execute([
+            {
+                "action": "remove_nodes_from_network_box", "box": {"name": "DUPLICATE"},
+                "nodes": [{"path": "POLE"}],
+            },
+        ], dry_run=True)
+
+        self.assertIn("does not exist", missing["errors"][0]["message"])
+        self.assertIn("ambiguous", ambiguous["errors"][0]["message"])
+        self.assertEqual(self.events, [])
 
     def test_nested_nodes_and_network_box_references(self):
         result = self.execute([

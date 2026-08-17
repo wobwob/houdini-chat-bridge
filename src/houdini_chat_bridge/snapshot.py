@@ -7,7 +7,7 @@ from typing import Any
 from .context import inspect_node
 
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 
 
 def snapshot_network(parent_or_nodes: Any, *, recursive: bool = False) -> dict[str, Any]:
@@ -17,8 +17,9 @@ def snapshot_network(parent_or_nodes: Any, *, recursive: bool = False) -> dict[s
     iterable of nodes to snapshot precisely those nodes. The result excludes
     Set ``recursive=True`` to include all descendants of a supplied network
     parent. The result excludes UI-oriented and time-dependent inspection
-    fields such as position and output connections. Node comments are retained
-    because the bridge can now change them deliberately.
+    fields such as output connections. Positions, comments, and root network
+    box membership are retained because PATCH actions can change them
+    deliberately.
     """
     nodes, root_path = _resolve_nodes(parent_or_nodes)
     if recursive:
@@ -37,11 +38,14 @@ def snapshot_network(parent_or_nodes: Any, *, recursive: bool = False) -> dict[s
         seen_paths.add(path)
         snapshots.append(snapshot)
 
-    return {
+    result = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "root_path": root_path,
         "nodes": sorted(snapshots, key=lambda item: item["path"]),
     }
+    if root_path is not None:
+        result["network_boxes"] = _snapshot_network_boxes(parent_or_nodes)
+    return result
 
 
 def _resolve_nodes(parent_or_nodes: Any) -> tuple[list[Any], str | None]:
@@ -71,12 +75,32 @@ def _snapshot_node(inspected: dict[str, Any]) -> dict[str, Any]:
         "name": _text(inspected.get("name")),
         "type_name": _text(inspected.get("type_name")),
         "type_category": _text(inspected.get("type_category")),
+        "position": _position(inspected.get("position")),
         "display_flag": _bool_or_none(inspected.get("display_flag")),
         "render_flag": _bool_or_none(inspected.get("render_flag")),
         "comment": _text(inspected.get("comment")),
         "input_connections": _snapshot_inputs(inspected.get("input_connections")),
         "parameters": _snapshot_parameters(inspected.get("parameters")),
     }
+
+
+def _snapshot_network_boxes(parent: Any) -> list[dict[str, Any]]:
+    """Capture named boxes in the execution network and their node members."""
+    boxes: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for network_box in _as_list(_call(parent, "networkBoxes")):
+        name = _text(_call(network_box, "name"))
+        if name is None:
+            continue
+        if name in seen_names:
+            raise ValueError("network snapshot contains duplicate network box name %r." % name)
+        seen_names.add(name)
+        node_paths = sorted({
+            path for item in _as_list(_call(network_box, "items"))
+            if (path := _text(_call(item, "path"))) is not None
+        })
+        boxes.append({"name": name, "node_paths": node_paths})
+    return sorted(boxes, key=lambda item: item["name"])
 
 
 def _collect_descendants(nodes: list[Any]) -> list[Any]:
@@ -172,6 +196,20 @@ def _text(value: Any) -> str | None:
 
 def _bool_or_none(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _position(value: Any) -> list[float] | None:
+    if value is None or isinstance(value, (str, bytes, dict)):
+        return None
+    try:
+        coordinates = list(value)
+    except TypeError:
+        return None
+    if len(coordinates) != 2:
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in coordinates):
+        return None
+    return [float(coordinates[0]), float(coordinates[1])]
 
 
 def _sort_index(value: int | None) -> int:

@@ -71,6 +71,23 @@ def delete_node(node: Any) -> None:
         raise RuntimeError("Could not delete node %s." % node_label(node)) from error
 
 
+def set_node_position(node: Any, position: tuple[float, float] | list[float]) -> Any:
+    """Set an existing node's Houdini network position and return the node."""
+    node = require_valid_node(node)
+    position = validate_position(position)
+    if position is None:  # Kept explicit for callers outside the executor.
+        raise ValueError("position must contain exactly two numeric values.")
+    set_position = require_method(
+        node, "setPosition", "Node %s does not support positioning." % node_label(node)
+    )
+    hou = _get_hou()
+    try:
+        set_position(hou.Vector2(position[0], position[1]))
+    except Exception as error:
+        raise RuntimeError("Could not position node %s." % node_label(node)) from error
+    return node
+
+
 def set_parameter(node: Any, parameter_name: str, value: Any) -> Any:
     """Set one existing parameter value and return ``node``."""
     parameter = require_parameter(node, parameter_name)
@@ -231,6 +248,55 @@ def add_nodes_to_network_box(network_box: Any, nodes: list[Any], fit: bool = Tru
         except Exception as error:
             raise RuntimeError("Could not add node %s to network box." % node_label(node)) from error
         existing_items.append(node)
+    if fit:
+        fit_around_contents = require_method(
+            network_box, "fitAroundContents", "Network box does not support fitting around contents."
+        )
+        try:
+            fit_around_contents()
+        except Exception as error:
+            raise RuntimeError("Could not fit network box around its contents.") from error
+    return network_box
+
+
+def delete_network_box(network_box: Any) -> None:
+    """Delete only a network box; Houdini leaves its contained nodes intact."""
+    _network_item_parent(network_box, "Network box")
+    destroy = require_method(network_box, "destroy", "Network box cannot be deleted.")
+    try:
+        destroy()
+    except Exception as error:
+        raise RuntimeError("Could not delete network box %s." % node_label(network_box)) from error
+
+
+def remove_nodes_from_network_box(network_box: Any, nodes: list[Any], fit: bool = True) -> Any:
+    """Remove existing nodes from a box, optionally fitting its remaining items."""
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("nodes must be a non-empty list of nodes.")
+    if not isinstance(fit, bool):
+        raise ValueError("fit must be a boolean.")
+    box_parent = _network_item_parent(network_box, "Network box")
+    remove_item = require_method(network_box, "removeItem", "Network box does not support removing items.")
+    existing_items = _network_box_items(network_box)
+    for node in nodes:
+        node = require_valid_node(node, "network box node")
+        node_parent = _network_item_parent(node, "Node")
+        if node_label(node_parent) != node_label(box_parent):
+            raise RuntimeError(
+                "Node %s belongs to %s, not network box parent %s."
+                % (node_label(node), node_label(node_parent), node_label(box_parent))
+            )
+        matching_item = next(
+            (item for item in existing_items if item is node or node_label(item) == node_label(node)),
+            None,
+        )
+        if matching_item is None:
+            continue
+        try:
+            remove_item(matching_item)
+        except Exception as error:
+            raise RuntimeError("Could not remove node %s from network box." % node_label(node)) from error
+        existing_items.remove(matching_item)
     if fit:
         fit_around_contents = require_method(
             network_box, "fitAroundContents", "Network box does not support fitting around contents."

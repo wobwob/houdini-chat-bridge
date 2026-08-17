@@ -14,7 +14,7 @@ from houdini_chat_bridge.snapshot import snapshot_network
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_snapshot_sorts_nodes_and_excludes_volatile_inspection_data_but_keeps_comments(self):
+    def test_snapshot_sorts_nodes_and_retains_patchable_state_but_excludes_outputs(self):
         first, second = object(), object()
         records = {
             id(first): {
@@ -52,7 +52,7 @@ class SnapshotTests(unittest.TestCase):
 
         self.assertEqual([node["path"] for node in result["nodes"]], ["/obj/build/a_first", "/obj/build/z_last"])
         last = result["nodes"][1]
-        self.assertNotIn("position", last)
+        self.assertEqual(last["position"], [99.0, 22.0])
         self.assertEqual(last["comment"], "Not part of a stable snapshot")
         self.assertNotIn("output_connections", last)
         self.assertEqual(last["parameters"][0], {"name": "animated", "expression": "$F", "expression_language": "Hscript"})

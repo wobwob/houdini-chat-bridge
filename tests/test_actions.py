@@ -14,7 +14,9 @@ from houdini_chat_bridge.actions import (
     create_network_box,
     create_node,
     create_sticky_note,
+    delete_network_box,
     disconnect_input,
+    remove_nodes_from_network_box,
     set_display_flag,
     set_expression,
     set_parameter,
@@ -71,6 +73,12 @@ class FakeNetworkBox:
 
     def addItem(self, item):
         self.contents.append(item)
+
+    def removeItem(self, item):
+        self.contents.remove(item)
+
+    def destroy(self):
+        self.parent_value.boxes.remove(self)
 
     def fitAroundContents(self):
         self.fit_count += 1
@@ -255,6 +263,21 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(box.fit_count, 2)
         with self.assertRaisesRegex(RuntimeError, "not network box parent"):
             add_nodes_to_network_box(box, [elsewhere])
+
+    def test_network_box_removal_and_deletion_preserve_nodes(self):
+        parent = FakeNode("/obj/custom")
+        first = FakeNode("/obj/custom/FIRST", parent=parent)
+        second = FakeNode("/obj/custom/SECOND", parent=parent)
+        box = create_network_box(parent, name="group")
+        add_nodes_to_network_box(box, [first, second], fit=False)
+
+        self.assertIs(remove_nodes_from_network_box(box, [first]), box)
+        self.assertEqual(box.contents, [second])
+        self.assertEqual(box.fit_count, 1)
+        delete_network_box(box)
+
+        self.assertNotIn(box, parent.boxes)
+        self.assertEqual(parent.children, [])
 
     def test_validation_rejects_invalid_position_and_path_as_a_name(self):
         parent = FakeNode("/obj/custom")

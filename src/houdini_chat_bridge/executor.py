@@ -38,9 +38,10 @@ from .validation import (
 
 DEFAULT_LABEL = "Houdini Chat Bridge batch"
 _SUPPORTED_ACTIONS = {
-    "create_node", "delete_node", "set_parameter", "set_expression", "connect_nodes",
+    "create_node", "delete_node", "set_node_position", "set_parameter", "set_expression", "connect_nodes",
     "disconnect_input", "set_display_flag", "set_render_flag", "set_node_comment",
-    "create_network_box", "add_nodes_to_network_box", "create_sticky_note",
+    "create_network_box", "add_nodes_to_network_box", "delete_network_box",
+    "remove_nodes_from_network_box", "create_sticky_note",
     "create_hda", "install_hda_parameter_interface", "install_node_parameter_interface",
 }
 _NODE_SYMBOL = "node"
@@ -133,7 +134,9 @@ def _result(label: Any, requested: list[dict[str, Any]]) -> dict[str, Any]:
 def _empty_diff() -> dict[str, list[Any]]:
     return {"created_nodes": [], "deleted_nodes": [], "modified_nodes": [],
             "parameter_changes": [], "connection_changes": [], "flag_changes": [],
-            "comment_changes": []}
+            "comment_changes": [], "position_changes": [],
+            "created_network_boxes": [], "deleted_network_boxes": [],
+            "network_box_membership_changes": []}
 
 
 def _preflight_batch(hou: Any, parent: Any, operations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -193,6 +196,12 @@ def _preflight_operation(hou: Any, parent: Any, operation: Mapping[str, Any], de
         if node is not None:
             _validate_delete_target(node, parent)
         return None
+    if action == "set_node_position":
+        _check_fields(operation, action, {"node", "position"}, set())
+        _preflight_node_target(hou, parent, operation["node"], "node", declared, available)
+        if validate_position(operation["position"]) is None:
+            raise ValueError("position must contain exactly two numeric values.")
+        return None
     if action == "set_parameter":
         _check_fields(operation, action, {"node", "parameter", "value"}, set())
         node = _preflight_node_target(hou, parent, operation["node"], "node", declared, available)
@@ -238,6 +247,21 @@ def _preflight_operation(hou: Any, parent: Any, operation: Mapping[str, Any], de
         _preflight_parent(hou, parent, operation.get("parent"), declared, available)
         return _created_symbol(operation, _NETWORK_BOX_SYMBOL, seen)
     if action == "add_nodes_to_network_box":
+        _check_fields(operation, action, {"box", "nodes"}, {"fit"})
+        _preflight_network_box_target(hou, parent, operation["box"], "box", declared, available)
+        nodes = operation["nodes"]
+        if not isinstance(nodes, list) or not nodes:
+            raise ValueError("nodes must be a non-empty list of node references.")
+        for index, node_reference in enumerate(nodes):
+            _preflight_node_target(hou, parent, node_reference, "nodes[%d]" % index, declared, available)
+        if "fit" in operation and not isinstance(operation["fit"], bool):
+            raise ValueError("fit must be a boolean.")
+        return None
+    if action == "delete_network_box":
+        _check_fields(operation, action, {"box"}, set())
+        _preflight_network_box_target(hou, parent, operation["box"], "box", declared, available)
+        return None
+    if action == "remove_nodes_from_network_box":
         _check_fields(operation, action, {"box", "nodes"}, {"fit"})
         _preflight_network_box_target(hou, parent, operation["box"], "box", declared, available)
         nodes = operation["nodes"]
@@ -310,11 +334,11 @@ def _preflight_node_target(hou: Any, root: Any, reference: Any, field_name: str,
 
 
 def _preflight_network_box_target(hou: Any, root: Any, reference: Any, field_name: str, declared: Mapping[str, str], available: Mapping[str, str]) -> Any | None:
-    reference_id = _reference_id(reference)
-    if reference_id is not None:
-        _preflight_symbol(reference_id, _NETWORK_BOX_SYMBOL, field_name, declared, available)
+    kind, value = _network_box_reference_spec(reference, field_name)
+    if kind == "ref":
+        _preflight_symbol(value, _NETWORK_BOX_SYMBOL, field_name, declared, available)
         return None
-    return _scoped_network_box_by_name(root, reference, field_name)
+    return _scoped_network_box_by_name(root, value, field_name)
 
 
 def _preflight_symbol(reference_id: str, expected_kind: str, field_name: str, declared: Mapping[str, str], available: Mapping[str, str]) -> None:
@@ -346,6 +370,10 @@ def _dispatch(plan: Mapping[str, Any], hou: Any, root: Any, symbols: dict[str, d
         actions.delete_node(node)
         _invalidate_node_symbol(symbols, operation["node"])
         return None
+    if action == "set_node_position":
+        return actions.set_node_position(
+            _runtime_node(hou, root, symbols, operation["node"], "node"), operation["position"]
+        )
     if action == "set_parameter":
         return actions.set_parameter(_runtime_node(hou, root, symbols, operation["node"], "node"), operation["parameter"], operation["value"])
     if action == "set_expression":
@@ -366,6 +394,17 @@ def _dispatch(plan: Mapping[str, Any], hou: Any, root: Any, symbols: dict[str, d
         return box
     if action == "add_nodes_to_network_box":
         return actions.add_nodes_to_network_box(_runtime_network_box(hou, root, symbols, operation["box"], "box"), [_runtime_node(hou, root, symbols, reference, "nodes[%d]" % index) for index, reference in enumerate(operation["nodes"])], fit=operation.get("fit", True))
+    if action == "delete_network_box":
+        actions.delete_network_box(_runtime_network_box(hou, root, symbols, operation["box"], "box"))
+        _invalidate_network_box_symbol(symbols, operation["box"])
+        return None
+    if action == "remove_nodes_from_network_box":
+        return actions.remove_nodes_from_network_box(
+            _runtime_network_box(hou, root, symbols, operation["box"], "box"),
+            [_runtime_node(hou, root, symbols, reference, "nodes[%d]" % index)
+             for index, reference in enumerate(operation["nodes"])],
+            fit=operation.get("fit", True),
+        )
     if action == "create_sticky_note":
         return actions.create_sticky_note(_runtime_parent(hou, root, symbols, operation.get("parent")), operation["text"], name=operation.get("name"))
     if action == "create_hda":
@@ -432,10 +471,10 @@ def _runtime_node_interface_target(
 
 
 def _runtime_network_box(hou: Any, root: Any, symbols: Mapping[str, Mapping[str, Any]], reference: Any, field_name: str) -> Any:
-    reference_id = _reference_id(reference)
-    if reference_id is not None:
-        return _runtime_symbol(symbols, reference_id, _NETWORK_BOX_SYMBOL, field_name)
-    return _scoped_network_box_by_name(root, reference, field_name)
+    kind, value = _network_box_reference_spec(reference, field_name)
+    if kind == "ref":
+        return _runtime_symbol(symbols, value, _NETWORK_BOX_SYMBOL, field_name)
+    return _scoped_network_box_by_name(root, value, field_name)
 
 
 def _runtime_symbol(symbols: Mapping[str, Mapping[str, Any]], reference_id: str, expected_kind: str, field_name: str) -> Any:
@@ -459,6 +498,14 @@ def _validate_delete_target(node: Any, root: Any) -> Any:
 def _invalidate_node_symbol(symbols: dict[str, dict[str, Any]], reference: Any) -> None:
     reference_id = _reference_id(reference)
     if reference_id is not None:
+        symbols.pop(reference_id, None)
+
+
+def _invalidate_network_box_symbol(symbols: dict[str, dict[str, Any]], reference: Any) -> None:
+    if not isinstance(reference, Mapping) or set(reference) != {"ref"}:
+        return
+    reference_id = reference.get("ref")
+    if isinstance(reference_id, str):
         symbols.pop(reference_id, None)
 
 
@@ -534,7 +581,7 @@ def _resolve_existing_node_path(root: Any, path: str) -> str:
 
 def _scoped_network_box_by_name(root: Any, name: Any, field_name: str) -> Any:
     if not isinstance(name, str) or not name:
-        raise ValueError("Action field %r must be a network box name string or {'ref': 'id'}." % field_name)
+        raise ValueError("Action field %r must be a network box name string, {'name': 'name'}, or {'ref': 'id'}." % field_name)
     try:
         boxes = root.networkBoxes()
     except Exception as error:
@@ -618,6 +665,33 @@ def _node_reference_spec(reference: Any, field_name: str) -> tuple[str, str]:
         return "path", value
     raise ValueError(
         "Node reference in field %r must contain exactly one of {'ref': 'id'} or {'path': 'path'}."
+        % field_name
+    )
+
+
+def _network_box_reference_spec(reference: Any, field_name: str) -> tuple[str, str]:
+    """Parse named existing network boxes and same-batch box references."""
+    if isinstance(reference, str):
+        if not reference:
+            raise ValueError("Action field %r must be a non-empty network box name." % field_name)
+        return "name", reference
+    if not isinstance(reference, Mapping):
+        raise ValueError(
+            "Action field %r must be a network box name string, {'name': 'name'}, or {'ref': 'id'}."
+            % field_name
+        )
+    if set(reference) == {"ref"}:
+        value = reference.get("ref")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Symbolic network box reference id must be a non-empty string.")
+        return "ref", value
+    if set(reference) == {"name"}:
+        value = reference.get("name")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Network box name must be a non-empty string.")
+        return "name", value
+    raise ValueError(
+        "Network box reference in field %r must contain exactly one of {'ref': 'id'} or {'name': 'name'}."
         % field_name
     )
 
